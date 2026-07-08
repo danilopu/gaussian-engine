@@ -46,6 +46,14 @@ gpu_image = (
     .env({"TORCH_CUDA_ARCH_LIST": "7.5", "QT_QPA_PLATFORM": "offscreen"})
 )
 
+# CPU-only OpenDroneMap image for the metric "blueprint" layer (orthophoto,
+# elevation model, textured mesh). ODM runs fine without a GPU; ffmpeg is
+# added for frame extraction.
+odm_image = (
+    modal.Image.from_registry("opendronemap/odm:3.5.6", add_python="3.11")
+    .apt_install("ffmpeg")
+)
+
 web_image = modal.Image.debian_slim(python_version="3.12").pip_install(
     "fastapi[standard]==0.115.*"
 )
@@ -137,10 +145,10 @@ def process_video(job_id: str):
             raise RuntimeError("export produced no .ply")
         shutil.copy(plys[-1], job_dir / "model.ply")
 
-        # free space: keep only the final model + a few debug bits
+        # free space: keep only the final model + a few debug bits.
+        # The input video is kept so the ODM map layer can reuse it.
         for sub in ("proc", "outputs", "export"):
             shutil.rmtree(job_dir / sub, ignore_errors=True)
-        video.unlink(missing_ok=True)
         volume.commit()
 
         _set(job_id, status="done", stage="done",
@@ -148,6 +156,102 @@ def process_video(job_id: str):
     except Exception as e:
         volume.commit()
         _set(job_id, status="error", error=str(e))
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Background ODM pipeline (CPU): orthophoto + DSM + textured mesh from the
+# same video. This is the metric/blueprint layer of the digital twin.
+# ---------------------------------------------------------------------------
+@app.function(
+    image=odm_image,
+    cpu=8,
+    memory=16384,
+    timeout=4 * 60 * 60,
+    volumes={DATA: volume},
+)
+def process_odm(job_id: str):
+    import json
+    import shutil
+    import subprocess
+    from pathlib import Path
+
+    volume.reload()
+    job_dir = Path(DATA) / "jobs" / job_id
+    videos = sorted(job_dir.glob("input.*"))
+    if not videos:
+        _set(job_id, odm_status="error", odm_error="input video no longer stored — re-upload it")
+        return
+    video = videos[0]
+
+    def run(stage: str, cmd: list[str]):
+        _set(job_id, odm_status="running", odm_stage=stage, odm_log="")
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, bufsize=1,
+        )
+        last_push = 0.0
+        tail: list[str] = []
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                tail = (tail + [line])[-4:]
+            if time.time() - last_push > 3:
+                _set(job_id, odm_log="\n".join(tail))
+                last_push = time.time()
+        proc.wait()
+        _set(job_id, odm_log="\n".join(tail))
+        if proc.returncode != 0:
+            raise RuntimeError(f"{stage} failed (exit {proc.returncode}): {tail[-1] if tail else ''}")
+
+    work = Path("/tmp/odm")  # scratch on container-local disk, not the volume
+    proj = work / "proj"
+    images = proj / "images"
+    try:
+        _set(job_id, odm_status="running", odm_stage="starting", odm_started=time.time())
+        images.mkdir(parents=True, exist_ok=True)
+
+        # ~120 frames spread evenly across the video
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "json", str(video)], capture_output=True, text=True)
+        duration = float(json.loads(probe.stdout)["format"]["duration"])
+        fps = min(120 / max(duration, 1.0), 4.0)
+        run("extracting frames", [
+            "ffmpeg", "-y", "-i", str(video), "-vf", f"fps={fps:.4f}",
+            "-q:v", "2", str(images / "frame_%04d.jpg"),
+        ])
+
+        run("photogrammetry (ODM)", [
+            "python3", "/code/run.py", "--project-path", str(work), "proj",
+            "--dsm", "--orthophoto-png", "--skip-report",
+            "--max-concurrency", "8",
+        ])
+
+        out = job_dir / "odm"
+        out.mkdir(exist_ok=True)
+        ortho = proj / "odm_orthophoto" / "odm_orthophoto.png"
+        dsm = proj / "odm_dem" / "dsm.tif"
+        if ortho.exists():
+            shutil.copy(ortho, out / "orthophoto.png")
+        if dsm.exists():
+            shutil.copy(dsm, out / "dsm.tif")
+            hill = work / "hill.tif"
+            subprocess.run(["gdaldem", "hillshade", str(dsm), str(hill), "-z", "1.5"], check=False)
+            if hill.exists():
+                subprocess.run(["gdal_translate", "-of", "PNG", str(hill),
+                                str(out / "hillshade.png")], check=False)
+        tex = proj / "odm_texturing"
+        if tex.exists():
+            shutil.make_archive(str(out / "mesh"), "zip", tex)
+        if not (out / "orthophoto.png").exists():
+            raise RuntimeError("ODM finished but produced no orthophoto")
+        volume.commit()
+        _set(job_id, odm_status="done", odm_stage="done",
+             odm_files=sorted(p.name for p in out.iterdir()))
+    except Exception as e:
+        volume.commit()
+        _set(job_id, odm_status="error", odm_error=str(e))
         raise
 
 
@@ -188,7 +292,7 @@ def web():
 
     @api.get("/api/version")
     def version():
-        return {"marker": "v-fly-measure-1", "autoframe_in_page": "autoFrame" in PAGE}
+        return {"marker": "v-odm-1", "autoframe_in_page": "autoFrame" in PAGE}
 
     @api.get("/api/jobs")
     def list_jobs():
@@ -211,6 +315,43 @@ def web():
             return JSONResponse({"error": "model not ready"}, status_code=404)
         return FileResponse(path, media_type="application/octet-stream",
                             filename=f"{job_id}.ply")
+
+    @api.post("/api/jobs/{job_id}/odm")
+    async def start_odm(job_id: str, video: UploadFile | None = None):
+        rec = jobs.get(job_id)
+        if rec is None:
+            return JSONResponse({"error": "unknown job"}, status_code=404)
+        if rec.get("odm_status") in ("queued", "running"):
+            return {"job_id": job_id, "odm_status": rec["odm_status"]}
+        job_dir = Path(DATA) / "jobs" / job_id
+        volume.reload()
+        if not any(job_dir.glob("input.*")):
+            if video is None:
+                # older jobs deleted their video after training; ask for it back
+                return JSONResponse({"error": "video no longer stored — re-upload it"},
+                                    status_code=409)
+            ext = (video.filename or "video.mp4").rsplit(".", 1)[-1].lower()
+            job_dir.mkdir(parents=True, exist_ok=True)
+            dest = job_dir / f"input.{ext}"
+            with dest.open("wb") as f:
+                while chunk := await video.read(8 * 1024 * 1024):
+                    f.write(chunk)
+            volume.commit()
+        _set(job_id, odm_status="queued", odm_stage="waiting for worker")
+        process_odm.spawn(job_id)
+        return {"job_id": job_id, "odm_status": "queued"}
+
+    @api.get("/api/jobs/{job_id}/odm/{fname}")
+    def odm_file(job_id: str, fname: str):
+        allowed = {"orthophoto.png": "image/png", "hillshade.png": "image/png",
+                   "dsm.tif": "image/tiff", "mesh.zip": "application/zip"}
+        if fname not in allowed:
+            return JSONResponse({"error": "unknown file"}, status_code=404)
+        volume.reload()
+        path = Path(DATA) / "jobs" / job_id / "odm" / fname
+        if not path.exists():
+            return JSONResponse({"error": "not ready"}, status_code=404)
+        return FileResponse(path, media_type=allowed[fname], filename=f"{job_id}-{fname}")
 
     return api
 
@@ -261,9 +402,19 @@ h2{font-size:15px;font-weight:500;color:var(--dim);text-transform:uppercase;
 .job .stage{font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--dim);margin-top:3px;
   white-space:pre-wrap;word-break:break-word}
 .job .stage.error{color:var(--err)}
-.job a,.job button.view{font:500 13px 'Space Grotesk',sans-serif;color:var(--text);background:transparent;
+.job a,.job button.view,.job button.act{font:500 13px 'Space Grotesk',sans-serif;color:var(--text);background:transparent;
   border:1px solid var(--line);border-radius:8px;padding:7px 14px;cursor:pointer;text-decoration:none}
-.job a:hover,.job button.view:hover{border-color:var(--iris);color:var(--iris)}
+.job a:hover,.job button.view:hover,.job button.act:hover{border-color:var(--iris);color:var(--iris)}
+/* blueprint overlay */
+#bpwrap{display:none;position:fixed;inset:0;z-index:30;background:var(--ink);overflow:auto}
+#bpwrap img{display:block;margin:0 auto;max-width:calc(100vw - 28px);height:auto;padding:64px 0 20px}
+#bpbar{position:fixed;top:14px;left:14px;z-index:2;display:flex;gap:8px;align-items:center;
+  background:rgba(13,17,26,.82);border:1px solid var(--line);border-radius:12px;padding:9px 12px;
+  backdrop-filter:blur(6px);font-family:'IBM Plex Mono',monospace;font-size:12px;max-width:calc(100vw - 28px);flex-wrap:wrap}
+#bpbar .vname{color:var(--iris);word-break:break-all}
+#bpbar button,#bpbar a{font:500 12.5px 'Space Grotesk',sans-serif;color:var(--text);background:transparent;
+  border:1px solid var(--line);border-radius:8px;padding:5px 11px;cursor:pointer;text-decoration:none}
+#bpbar button:hover,#bpbar a:hover{border-color:var(--iris);color:var(--iris)}
 #empty{color:var(--dim);font-size:14px;padding:6px 0}
 /* viewer modal */
 #viewerwrap{display:none;position:fixed;inset:0;z-index:20;background:var(--ink)}
@@ -307,6 +458,16 @@ h2{font-size:15px;font-weight:500;color:var(--dim);text-transform:uppercase;
   <div class="card">
     <h2>Jobs</h2>
     <div id="jobs"><div id="empty">Nothing yet. Your finished models appear here &mdash; they stay saved between visits.</div></div>
+  </div>
+</div>
+
+<div id="bpwrap">
+  <img id="bpimg" alt="orthophoto"/>
+  <div id="bpbar">
+    <span class="vname" id="bpname"></span>
+    <button id="bpmode" title="Toggle orthophoto / elevation relief">Relief</button>
+    <a id="bpdsm" href="#" title="Elevation model GeoTIFF">DSM .tif</a>
+    <button id="bpclose">Close</button>
   </div>
 </div>
 
@@ -377,21 +538,71 @@ async function refresh(){
     if(!list.length){ box.innerHTML = '<div id="empty">Nothing yet. Your finished models appear here \u2014 they stay saved between visits.</div>'; return; }
     box.innerHTML = list.map(r => {
       const st = r.status || 'queued';
-      const stage = st==='error' ? (r.error||'failed') : (r.stage||st) + fmtElapsed(r);
+      let stage = st==='error' ? (r.error||'failed') : (r.stage||st) + fmtElapsed(r);
       const log = st==='running' && r.log ? `\n${r.log}` : '';
-      const act = st==='done'
-        ? `<button class="view" data-id="${r.job_id}" data-name="${esc(r.name)}">View in 3D</button>
-           <a href="/api/jobs/${r.job_id}/model.ply">Download .ply${r.size_mb?` (${r.size_mb} MB)`:''}</a>`
-        : '';
+      const os = r.odm_status;
+      if(os==='queued'||os==='running') stage += `\nmap layer: ${r.odm_stage||os}${r.odm_log?'\n'+r.odm_log:''}`;
+      else if(os==='error') stage += `\nmap layer failed: ${r.odm_error||''}`;
+      let act = '';
+      if(st==='done'){
+        act = `<button class="view" data-id="${r.job_id}" data-name="${esc(r.name)}">View in 3D</button>
+           <a href="/api/jobs/${r.job_id}/model.ply">Download .ply${r.size_mb?` (${r.size_mb} MB)`:''}</a>`;
+        if(os==='done')
+          act += `<button class="act bp" data-id="${r.job_id}" data-name="${esc(r.name)}">Blueprint</button>
+           <a href="/api/jobs/${r.job_id}/odm/mesh.zip">Mesh</a>`;
+        else if(os!=='queued' && os!=='running')
+          act += `<button class="act odmgo" data-id="${r.job_id}" title="Build orthophoto + elevation + mesh on a CPU worker (~1–2 h)">${os==='error'?'Retry map':'Map layer'}</button>`;
+      }
       return `<div class="job"><span class="dot ${st}"></span>
         <div class="meta"><div class="name">${esc(r.name)||r.job_id}</div>
         <div class="stage ${st==='error'?'error':''}">${esc(stage)}${esc(log)}</div></div>${act}</div>`;
     }).join('');
     box.querySelectorAll('button.view').forEach(b =>
       b.addEventListener('click', () => openViewer(b.dataset.id, b.dataset.name)));
+    box.querySelectorAll('button.odmgo').forEach(b =>
+      b.addEventListener('click', () => startOdm(b.dataset.id)));
+    box.querySelectorAll('button.bp').forEach(b =>
+      b.addEventListener('click', () => openBlueprint(b.dataset.id, b.dataset.name)));
   }catch(e){ /* transient network errors: just retry next tick */ }
 }
 refresh(); setInterval(refresh, 4000);
+
+// ---------- ODM map layer ----------
+async function startOdm(id, file){
+  const opts = {method:'POST'};
+  if(file){ const fd = new FormData(); fd.append('video', file); opts.body = fd; }
+  try{
+    const r = await fetch(`/api/jobs/${id}/odm`, opts);
+    if(r.status === 409){
+      // this job's video was cleaned up after training: ask for it again
+      const inp = document.createElement('input');
+      inp.type = 'file'; inp.accept = 'video/*';
+      inp.addEventListener('change', () => { if(inp.files[0]) startOdm(id, inp.files[0]); });
+      inp.click();
+      return;
+    }
+  }catch(e){ /* transient; job list will show state */ }
+  refresh();
+}
+
+let bpMode = 'orthophoto';
+function openBlueprint(id, name){
+  bpMode = 'orthophoto';
+  $('bpwrap').dataset.id = id;
+  $('bpname').textContent = (name || id) + ' — orthophoto';
+  $('bpimg').src = `/api/jobs/${id}/odm/orthophoto.png`;
+  $('bpdsm').href = `/api/jobs/${id}/odm/dsm.tif`;
+  $('bpmode').textContent = 'Relief';
+  $('bpwrap').style.display = 'block';
+}
+$('bpmode').addEventListener('click', () => {
+  const id = $('bpwrap').dataset.id;
+  bpMode = bpMode === 'orthophoto' ? 'hillshade' : 'orthophoto';
+  $('bpimg').src = `/api/jobs/${id}/odm/${bpMode}.png`;
+  $('bpname').textContent = $('bpname').textContent.replace(/— .*$/, '— ' + (bpMode === 'orthophoto' ? 'orthophoto' : 'elevation relief'));
+  $('bpmode').textContent = bpMode === 'orthophoto' ? 'Relief' : 'Ortho';
+});
+$('bpclose').addEventListener('click', () => { $('bpwrap').style.display = 'none'; $('bpimg').removeAttribute('src'); });
 
 // ---------- viewer ----------
 let viewer = null, vJob = null, vName = null, flipped = false;
