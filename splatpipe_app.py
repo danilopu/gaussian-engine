@@ -186,6 +186,10 @@ def web():
         process_video.spawn(job_id)
         return {"job_id": job_id}
 
+    @api.get("/api/version")
+    def version():
+        return {"marker": "v-autoframe-1", "autoframe_in_page": "autoFrame" in PAGE}
+
     @api.get("/api/jobs")
     def list_jobs():
         items = [{"job_id": k, **v} for k, v in jobs.items()]
@@ -319,6 +323,7 @@ h2{font-size:15px;font-weight:500;color:var(--dim);text-transform:uppercase;
 }}
 </script>
 <script type="module">
+import * as THREE from 'three';
 import * as GS from '@mkkellogg/gaussian-splats-3d';
 
 const $ = (id) => document.getElementById(id);
@@ -379,6 +384,27 @@ refresh(); setInterval(refresh, 4000);
 
 // ---------- viewer ----------
 let viewer = null, vJob = null, vName = null, flipped = false;
+
+// COLMAP puts each scene in an arbitrary coordinate frame, so a fixed camera
+// can open onto empty space. Aim at the robust center of the splat mass.
+function autoFrame(){
+  const mesh = viewer.splatMesh;
+  const n = mesh.getSplatCount();
+  if(!n) return;
+  const step = Math.max(1, Math.floor(n/20000));
+  const pt = new THREE.Vector3();
+  const xs=[], ys=[], zs=[];
+  for(let i=0;i<n;i+=step){ mesh.getSplatCenter(i, pt); xs.push(pt.x); ys.push(pt.y); zs.push(pt.z); }
+  const med = a => { a.sort((p,q)=>p-q); return a[a.length>>1]; };
+  const c = new THREE.Vector3(med(xs), med(ys), med(zs));
+  const ds = xs.map((x,i)=>Math.hypot(x-c.x, ys[i]-c.y, zs[i]-c.z)).sort((p,q)=>p-q);
+  const r = Math.max(ds[Math.floor(ds.length*0.7)], 0.5);  // core radius, ignore floater shell
+  const dir = new THREE.Vector3(0,0,-1)
+    .addScaledVector(new THREE.Vector3().copy(viewer.camera.up), 0.4).normalize();
+  viewer.camera.position.copy(c).addScaledVector(dir, r*2.2);
+  viewer.camera.lookAt(c);
+  if(viewer.controls){ viewer.controls.target.copy(c); viewer.controls.update(); }
+}
 async function openViewer(jobId, name, keepFlip=false){
   if(!keepFlip) flipped = false;
   vJob = jobId; vName = name;
@@ -399,6 +425,7 @@ async function openViewer(jobId, name, keepFlip=false){
       splatAlphaRemovalThreshold: 5,
       onProgress: (p,l) => { $('vprogress').textContent = `${l||'loading'} ${Math.round(p)}%`; },
     });
+    try{ autoFrame(); }catch(e){ console.log('auto-frame failed:', e); }
     viewer.start();
     $('vprogress').style.display = 'none';
   }catch(e){ $('vprogress').textContent = 'Failed to load model: ' + (e.message||e); }
