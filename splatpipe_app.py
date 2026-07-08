@@ -188,7 +188,7 @@ def web():
 
     @api.get("/api/version")
     def version():
-        return {"marker": "v-autoframe-1", "autoframe_in_page": "autoFrame" in PAGE}
+        return {"marker": "v-fly-measure-1", "autoframe_in_page": "autoFrame" in PAGE}
 
     @api.get("/api/jobs")
     def list_jobs():
@@ -275,6 +275,10 @@ h2{font-size:15px;font-weight:500;color:var(--dim);text-transform:uppercase;
 #viewerbar button{font:500 12.5px 'Space Grotesk',sans-serif;color:var(--text);background:transparent;
   border:1px solid var(--line);border-radius:8px;padding:5px 11px;cursor:pointer}
 #viewerbar button:hover{border-color:var(--iris);color:var(--iris)}
+#viewerbar button.on{border-color:var(--iris);color:var(--iris)}
+#viewerbar input{font:500 12.5px 'IBM Plex Mono',monospace;color:var(--text);background:var(--ink);
+  border:1px solid var(--line);border-radius:8px;padding:5px 8px;width:110px}
+#vread{color:var(--ok)}
 #vprogress{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:1;
   font-family:'IBM Plex Mono',monospace;font-size:13px;color:var(--dim)}
 </style>
@@ -312,6 +316,13 @@ h2{font-size:15px;font-weight:500;color:var(--dim);text-transform:uppercase;
   <div id="viewerbar">
     <span class="vname" id="vname"></span>
     <button id="vflip" title="Model upside down? Flip the camera's up axis">Flip up-axis</button>
+    <button id="vfly" title="Free-fly camera: WASD + mouse look, E/Q up/down, Shift fast, scroll = speed, Esc exits">Fly</button>
+    <button id="vmeasure" title="Click two points on the model to measure the distance">Measure</button>
+    <span id="vread"></span>
+    <span id="vcal" style="display:none">
+      <input id="vcalin" type="number" min="0" step="any" placeholder="real length (m)"/>
+      <button id="vcalok" title="Enter the real-world length of the last measurement to calibrate this model to meters">Set scale</button>
+    </span>
     <button id="vclose">Close</button>
   </div>
 </div>
@@ -399,6 +410,7 @@ function autoFrame(){
   const c = new THREE.Vector3(med(xs), med(ys), med(zs));
   const ds = xs.map((x,i)=>Math.hypot(x-c.x, ys[i]-c.y, zs[i]-c.z)).sort((p,q)=>p-q);
   const r = Math.max(ds[Math.floor(ds.length*0.7)], 0.5);  // core radius, ignore floater shell
+  coreRadius = r; flySpeed = r * 0.5;
   const dir = new THREE.Vector3(0,0,-1)
     .addScaledVector(new THREE.Vector3().copy(viewer.camera.up), 0.4).normalize();
   viewer.camera.position.copy(c).addScaledVector(dir, r*2.2);
@@ -411,6 +423,8 @@ async function openViewer(jobId, name, keepFlip=false){
   $('viewerwrap').style.display = 'block';
   $('vprogress').style.display = 'block';
   $('vname').textContent = name || jobId;
+  if(flyOn) setFly(false);
+  setMeasure(false); markGroup = null; mPts = []; lastDist = null; setRead('');
   if(viewer){ try{ await viewer.dispose(); }catch(e){} viewer = null; }
   $('viewer').replaceChildren();
   viewer = new GS.Viewer({
@@ -426,6 +440,7 @@ async function openViewer(jobId, name, keepFlip=false){
       onProgress: (p,l) => { $('vprogress').textContent = `${l||'loading'} ${Math.round(p)}%`; },
     });
     try{ autoFrame(); }catch(e){ console.log('auto-frame failed:', e); }
+    if(viewer.threeScene){ markGroup = new THREE.Group(); viewer.threeScene.add(markGroup); }
     viewer.start();
     $('vprogress').style.display = 'none';
   }catch(e){ $('vprogress').textContent = 'Failed to load model: ' + (e.message||e); }
@@ -435,6 +450,144 @@ $('vclose').addEventListener('click', async () => {
   if(viewer){ try{ await viewer.dispose(); }catch(e){} viewer = null; $('viewer').replaceChildren(); }
 });
 $('vflip').addEventListener('click', () => { if(vJob){ flipped = !flipped; openViewer(vJob, vName, true); } });
+
+// ---------- fly camera + measure tool ----------
+let flyOn = false, measureOn = false, savedControls = null;
+let coreRadius = 4, flySpeed = 2, flyLastT = 0;
+let markGroup = null, mPts = [], lastDist = null;
+const keys = {};
+
+function setRead(t){ $('vread').textContent = t; }
+function getScale(){
+  const v = parseFloat(localStorage.getItem('splatscale-' + vJob));
+  return (isFinite(v) && v > 0) ? v : null;
+}
+function fmtDist(d){
+  const s = getScale();
+  return d.toFixed(2) + ' units' + (s ? ` = ${(d*s).toFixed(2)} m` : ' (uncalibrated)');
+}
+
+// -- fly: detach OrbitControls (its update() overwrites external camera moves)
+function setFly(on){
+  if(!viewer && on) return;
+  flyOn = on;
+  $('vfly').classList.toggle('on', on);
+  if(on){
+    setMeasure(false);
+    savedControls = viewer.controls;
+    viewer.controls = null;
+    const el = viewer.renderer && viewer.renderer.domElement;
+    if(el && el.requestPointerLock) el.requestPointerLock();
+    flyLastT = performance.now();
+    requestAnimationFrame(flyTick);
+    setRead('WASD move · E/Q up/down · Shift fast · scroll speed · Esc exit');
+  }else{
+    if(document.exitPointerLock && document.pointerLockElement) document.exitPointerLock();
+    if(viewer && savedControls){
+      viewer.controls = savedControls;
+      const fwd = new THREE.Vector3(0,0,-1).applyQuaternion(viewer.camera.quaternion);
+      viewer.controls.target.copy(viewer.camera.position).addScaledVector(fwd, Math.max(coreRadius*0.6, 0.1));
+      viewer.controls.update();
+    }
+    savedControls = null;
+    setRead('');
+  }
+}
+function flyTick(t){
+  if(!flyOn || !viewer) return;
+  const dt = Math.min((t - flyLastT)/1000, 0.1); flyLastT = t;
+  const cam = viewer.camera;
+  const fwd = new THREE.Vector3(0,0,-1).applyQuaternion(cam.quaternion);
+  const right = new THREE.Vector3(1,0,0).applyQuaternion(cam.quaternion);
+  const v = new THREE.Vector3();
+  if(keys['KeyW']) v.add(fwd);   if(keys['KeyS']) v.sub(fwd);
+  if(keys['KeyD']) v.add(right); if(keys['KeyA']) v.sub(right);
+  if(keys['KeyE']||keys['Space']) v.add(cam.up); if(keys['KeyQ']) v.sub(cam.up);
+  if(v.lengthSq() > 0){
+    v.normalize().multiplyScalar(flySpeed * ((keys['ShiftLeft']||keys['ShiftRight']) ? 4 : 1) * dt);
+    cam.position.add(v);
+  }
+  requestAnimationFrame(flyTick);
+}
+$('vfly').addEventListener('click', () => setFly(!flyOn));
+document.addEventListener('pointerlockchange', () => {
+  if(!document.pointerLockElement && flyOn) setFly(false);
+});
+document.addEventListener('mousemove', e => {
+  if(!flyOn || !document.pointerLockElement || !viewer) return;
+  const cam = viewer.camera;
+  // yaw around the scene's visual up so the horizon stays level, pitch around local right
+  const yaw = new THREE.Quaternion().setFromAxisAngle(cam.up, -e.movementX * 0.002);
+  cam.quaternion.premultiply(yaw);
+  const right = new THREE.Vector3(1,0,0).applyQuaternion(cam.quaternion);
+  const pitch = new THREE.Quaternion().setFromAxisAngle(right, -e.movementY * 0.002);
+  cam.quaternion.premultiply(pitch);
+});
+document.addEventListener('keydown', e => {
+  if(e.target.tagName === 'INPUT') return;
+  keys[e.code] = true;
+  if(flyOn && ['KeyW','KeyA','KeyS','KeyD','KeyQ','KeyE','Space'].includes(e.code)) e.preventDefault();
+});
+document.addEventListener('keyup', e => { keys[e.code] = false; });
+document.addEventListener('wheel', e => {
+  if(flyOn) flySpeed = Math.max(0.01, flySpeed * (e.deltaY < 0 ? 1.25 : 0.8));
+}, {passive: true});
+
+// -- measure: pick splat surface points with the library's raycaster
+function setMeasure(on){
+  measureOn = on;
+  $('vmeasure').classList.toggle('on', on);
+  if(on){ if(flyOn) setFly(false); clearMarks(); setRead('click the first point on the model'); }
+  else { clearMarks(); setRead(''); }
+}
+function clearMarks(){
+  mPts = []; lastDist = null;
+  if(markGroup) markGroup.clear();
+  $('vcal').style.display = 'none';
+}
+function addMark(p){
+  if(!markGroup) return;
+  const s = new THREE.Mesh(new THREE.SphereGeometry(coreRadius*0.012, 16, 16),
+                           new THREE.MeshBasicMaterial({color: 0x9d8cff}));
+  s.position.copy(p); markGroup.add(s);
+}
+function pickPoint(e){
+  const dims = new THREE.Vector2();
+  viewer.getRenderDimensions(dims);
+  viewer.raycaster.setFromCameraAndScreenPosition(
+    viewer.camera, new THREE.Vector2(e.offsetX, e.offsetY), dims);
+  const hits = [];
+  viewer.raycaster.intersectSplatMesh(viewer.splatMesh, hits);
+  return hits.length ? hits[0].origin.clone() : null;
+}
+let mDown = null;
+$('viewer').addEventListener('mousedown', e => { mDown = [e.clientX, e.clientY]; }, true);
+$('viewer').addEventListener('mouseup', e => {
+  if(!measureOn || flyOn || !viewer) return;
+  if(mDown && Math.hypot(e.clientX - mDown[0], e.clientY - mDown[1]) > 5) return;  // was a drag
+  e.stopPropagation();  // keep the viewer's click-to-refocus out of measure clicks
+  const p = pickPoint(e);
+  if(!p){ setRead('no surface under cursor — click on the model'); return; }
+  if(mPts.length === 2) clearMarks();
+  mPts.push(p); addMark(p);
+  if(mPts.length === 2){
+    lastDist = mPts[0].distanceTo(mPts[1]);
+    if(markGroup){
+      const g = new THREE.BufferGeometry().setFromPoints(mPts);
+      markGroup.add(new THREE.Line(g, new THREE.LineBasicMaterial({color: 0x9d8cff})));
+    }
+    setRead(fmtDist(lastDist));
+    $('vcal').style.display = '';
+  }else setRead('point 1 set — click the second point');
+}, true);
+$('vmeasure').addEventListener('click', () => setMeasure(!measureOn));
+$('vcalok').addEventListener('click', () => {
+  const m = parseFloat($('vcalin').value);
+  if(!(m > 0) || !lastDist){ setRead('measure a distance first, then enter its real length'); return; }
+  localStorage.setItem('splatscale-' + vJob, String(m / lastDist));
+  $('vcalin').value = '';
+  setRead(fmtDist(lastDist));
+});
 </script>
 </body>
 </html>
