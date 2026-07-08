@@ -37,6 +37,9 @@ gpu_image = (
     modal.Image.from_registry("nvidia/cuda:12.1.1-devel-ubuntu22.04", add_python="3.10")
     .apt_install("colmap", "ffmpeg", "git", "libgl1", "libglib2.0-0")
     .pip_install("torch==2.1.2", "torchvision==0.16.2")
+    # Modal's builder sets CC/CXX to clang, which this image doesn't have;
+    # point them at gcc so nerfstudio's source deps (fpsample, pyliblzfse) build
+    .env({"CC": "gcc", "CXX": "g++"})
     .pip_install("nerfstudio")
     # gsplat compiles its CUDA kernels on first use; make sure it targets the T4
     .env({"TORCH_CUDA_ARCH_LIST": "7.5"})
