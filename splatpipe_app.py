@@ -626,8 +626,8 @@ h2{font-size:15px;font-weight:500;color:var(--dim);text-transform:uppercase;
   border:1px solid var(--line);border-radius:8px;padding:7px 14px;cursor:pointer;text-decoration:none}
 .job a:hover,.job button.view:hover,.job button.act:hover{border-color:var(--iris);color:var(--iris)}
 /* blueprint overlay */
-#bpwrap{display:none;position:fixed;inset:0;z-index:30;background:var(--ink);overflow:auto;text-align:center}
-#bpcanvas{position:relative;display:inline-block;margin-top:64px}
+#bpwrap{display:none;position:fixed;inset:0;z-index:30;background:var(--ink);overflow:hidden;text-align:center}
+#bpcanvas{position:relative;display:inline-block;margin-top:64px;transform-origin:0 0}
 #bpwrap img{display:block;max-width:calc(100vw - 28px);height:auto}
 .regdot{position:absolute;width:18px;height:18px;border-radius:50%;transform:translate(-50%,-50%);
   font:600 11px 'IBM Plex Mono',monospace;color:#0b0e14;display:flex;align-items:center;
@@ -693,6 +693,7 @@ h2{font-size:15px;font-weight:500;color:var(--dim);text-transform:uppercase;
     <button id="bpreg" title="Mark the map spots matching your numbered 3D points (in order)">Register</button>
     <button id="bpalign" title="Compute the splat-to-map alignment from the point pairs">Align</button>
     <button id="bpclearpts" title="Clear all registration points">Clear pts</button>
+    <button id="bpfit" title="Reset zoom and pan">Reset view</button>
     <span id="bpread"></span>
     <a id="bpdsm" href="#" title="Elevation model GeoTIFF">DSM .tif</a>
     <button id="bpclose">Close</button>
@@ -860,6 +861,7 @@ function openBlueprint(id, name){
   if(regBpJob !== id){ regOdm = []; regOdmUV = []; regBpJob = id; }
   else regOdmUV.forEach((uv, i) => bpAddDot(uv[0], uv[1], i));
   bpMode = 'orthophoto';
+  bpResetView();
   $('bpwrap').dataset.id = id;
   $('bpname').textContent = (name || id) + ' — orthophoto';
   $('bpimg').src = `/api/jobs/${id}/odm/orthophoto.png`;
@@ -877,6 +879,37 @@ $('bpmode').addEventListener('click', () => {
   bpDotsVisible(bpMode === 'orthophoto');   // dots are ortho-frame only
 });
 $('bpclose').addEventListener('click', () => { $('bpwrap').style.display = 'none'; $('bpimg').removeAttribute('src'); bpMetaJob = null; });
+
+// -- blueprint zoom (wheel, toward cursor) + drag pan
+let bpZoom = 1, bpTx = 0, bpTy = 0, bpDrag = null, bpDragDist = 0;
+function bpApply(){ $('bpcanvas').style.transform = `translate(${bpTx}px,${bpTy}px) scale(${bpZoom})`; }
+function bpResetView(){ bpZoom = 1; bpTx = 0; bpTy = 0; bpApply(); }
+$('bpfit').addEventListener('click', bpResetView);
+$('bpwrap').addEventListener('wheel', e => {
+  e.preventDefault();
+  const rect = $('bpcanvas').getBoundingClientRect();
+  const u = (e.clientX - rect.left) / rect.width, v = (e.clientY - rect.top) / rect.height;
+  const baseL = rect.left - bpTx, baseT = rect.top - bpTy;
+  const baseW = rect.width / bpZoom, baseH = rect.height / bpZoom;
+  bpZoom = Math.min(14, Math.max(1, bpZoom * (e.deltaY < 0 ? 1.25 : 0.8)));
+  if(bpZoom === 1){ bpTx = 0; bpTy = 0; }
+  else{
+    bpTx = e.clientX - u * baseW * bpZoom - baseL;
+    bpTy = e.clientY - v * baseH * bpZoom - baseT;
+  }
+  bpApply();
+}, {passive: false});
+$('bpwrap').addEventListener('mousedown', e => { bpDrag = [e.clientX, e.clientY, bpTx, bpTy]; bpDragDist = 0; });
+document.addEventListener('mousemove', e => {
+  if(!bpDrag) return;
+  bpDragDist = Math.max(bpDragDist, Math.hypot(e.clientX - bpDrag[0], e.clientY - bpDrag[1]));
+  if(bpDragDist > 5){
+    bpTx = bpDrag[2] + (e.clientX - bpDrag[0]);
+    bpTy = bpDrag[3] + (e.clientY - bpDrag[1]);
+    bpApply();
+  }
+});
+document.addEventListener('mouseup', () => { bpDrag = null; });
 
 // -- registration: map-side point picking
 function setBpReg(on){
@@ -904,6 +937,7 @@ function dsmElev(X, Y){
 }
 
 $('bpimg').addEventListener('click', e => {
+  if(bpDragDist > 5) return;                       // that was a pan, not a pick
   if(!regOnBp || bpMode !== 'orthophoto') return;
   if(!bpMeta){ bpRead('map metadata still loading…'); return; }
   if(regOdm.length >= 5){ bpRead('5 points max — Align or Clear pts'); return; }
