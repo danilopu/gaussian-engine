@@ -176,9 +176,15 @@ def process_video(job_id: str):
 )
 def process_odm(job_id: str):
     import json
+    import os
     import shutil
     import subprocess
     from pathlib import Path
+
+    # ODM's helper scripts call bare `python3`; Modal's injected python
+    # shadows the image's system python (which has all ODM/OpenSfM native
+    # deps), so put /usr/bin first for the whole ODM process tree.
+    odm_env = dict(os.environ, PATH="/usr/bin:" + os.environ.get("PATH", ""))
 
     volume.reload()
     job_dir = Path(DATA) / "jobs" / job_id
@@ -192,13 +198,14 @@ def process_odm(job_id: str):
         _set(job_id, odm_status="running", odm_stage=stage, odm_log="")
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True, bufsize=1,
+            stderr=subprocess.STDOUT, text=True, bufsize=1, env=odm_env,
         )
         last_push = 0.0
         tail: list[str] = []
         for line in proc.stdout:
             line = line.rstrip()
             if line:
+                print(line, flush=True)  # full log lands in `modal app logs`
                 tail = (tail + [line])[-4:]
             if time.time() - last_push > 3:
                 _set(job_id, odm_log="\n".join(tail))
@@ -232,14 +239,27 @@ def process_odm(job_id: str):
             "/usr/bin/python3", "/code/run.py", "--project-path", str(work), "proj",
             "--dsm", "--orthophoto-png", "--skip-report",
             "--max-concurrency", "8",
+            # video frames carry no EXIF/GPS; make reconstruction tolerant:
+            "--min-num-features", "12000",     # hazy aerial imagery
+            "--matcher-type", "bruteforce",    # exhaustive matching, ~120 images is small
+            "--ignore-gsd",                    # GSD heuristics assume GPS/altitude
         ])
 
         out = job_dir / "odm"
         out.mkdir(exist_ok=True)
-        ortho = proj / "odm_orthophoto" / "odm_orthophoto.png"
+        ortho_dir = proj / "odm_orthophoto"
+        print("odm_orthophoto dir:", sorted(p.name for p in ortho_dir.iterdir()) if ortho_dir.exists() else "MISSING", flush=True)
+        ortho_png = ortho_dir / "odm_orthophoto.png"
+        ortho_tif = ortho_dir / "odm_orthophoto.tif"
         dsm = proj / "odm_dem" / "dsm.tif"
-        if ortho.exists():
-            shutil.copy(ortho, out / "orthophoto.png")
+        if ortho_tif.exists():
+            shutil.copy(ortho_tif, out / "orthophoto.tif")
+        if ortho_png.exists():
+            shutil.copy(ortho_png, out / "orthophoto.png")
+        elif ortho_tif.exists():
+            # don't depend on ODM's --orthophoto-png; render the PNG ourselves
+            subprocess.run(["gdal_translate", "-of", "PNG", "-ot", "Byte", "-scale",
+                            str(ortho_tif), str(out / "orthophoto.png")], check=False, env=odm_env)
         if dsm.exists():
             shutil.copy(dsm, out / "dsm.tif")
             hill = work / "hill.tif"
@@ -343,13 +363,15 @@ def web():
                 while chunk := await video.read(8 * 1024 * 1024):
                     f.write(chunk)
             volume.commit()
-        _set(job_id, odm_status="queued", odm_stage="waiting for worker")
+        _set(job_id, odm_status="queued", odm_stage="waiting for worker",
+             odm_error="", odm_log="")
         process_odm.spawn(job_id)
         return {"job_id": job_id, "odm_status": "queued"}
 
     @api.get("/api/jobs/{job_id}/odm/{fname}")
     def odm_file(job_id: str, fname: str):
-        allowed = {"orthophoto.png": "image/png", "hillshade.png": "image/png",
+        allowed = {"orthophoto.png": "image/png", "orthophoto.tif": "image/tiff",
+                   "hillshade.png": "image/png",
                    "dsm.tif": "image/tiff", "mesh.zip": "application/zip"}
         if fname not in allowed:
             return JSONResponse({"error": "unknown file"}, status_code=404)
