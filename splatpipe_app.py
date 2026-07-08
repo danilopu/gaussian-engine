@@ -163,6 +163,35 @@ def process_video(job_id: str):
         raise
 
 
+# Runs under the ODM image's system python (has GDAL+numpy): writes meta.json
+# with the orthophoto geotransform and a downsampled DSM elevation grid so the
+# frontend can turn a click on the blueprint into a 3D map-frame point.
+ODM_META_SCRIPT = """
+import json, sys
+from osgeo import gdal
+ortho = gdal.Open(sys.argv[1]); dsm = gdal.Open(sys.argv[2])
+band = dsm.GetRasterBand(1)
+w, h = dsm.RasterXSize, dsm.RasterYSize
+gw = min(300, w); gh = max(1, round(h * gw / w))
+arr = band.ReadAsArray(buf_xsize=gw, buf_ysize=gh)
+nd = band.GetNoDataValue()
+grid = []
+for row in arr:
+    out = []
+    for v in row:
+        fv = float(v)
+        bad = fv != fv or (nd is not None and abs(fv - nd) < 1e-6)
+        out.append(None if bad else round(fv, 2))
+    grid.append(out)
+meta = {
+  "ortho": {"gt": list(ortho.GetGeoTransform()), "size": [ortho.RasterXSize, ortho.RasterYSize]},
+  "dsm": {"gt": list(dsm.GetGeoTransform()), "size": [w, h], "grid_size": [gw, gh], "grid": grid},
+}
+json.dump(meta, open(sys.argv[3], "w"))
+print("meta.json written", gw, "x", gh)
+"""
+
+
 # ---------------------------------------------------------------------------
 # Background ODM pipeline (CPU): orthophoto + DSM + textured mesh from the
 # same video. This is the metric/blueprint layer of the digital twin.
@@ -270,6 +299,10 @@ def process_odm(job_id: str):
         tex = proj / "odm_texturing"
         if tex.exists():
             shutil.make_archive(str(out / "mesh"), "zip", tex)
+        if (out / "orthophoto.tif").exists() and (out / "dsm.tif").exists():
+            subprocess.run(["/usr/bin/python3", "-c", ODM_META_SCRIPT,
+                            str(out / "orthophoto.tif"), str(out / "dsm.tif"),
+                            str(out / "meta.json")], check=False, env=odm_env)
         if not (out / "orthophoto.png").exists():
             raise RuntimeError("ODM finished but produced no orthophoto")
         volume.commit()
@@ -279,6 +312,25 @@ def process_odm(job_id: str):
         volume.commit()
         _set(job_id, odm_status="error", odm_error=str(e))
         raise
+
+
+# Backfill map metadata for ODM runs made before meta.json existed
+@app.function(image=odm_image, cpu=2, memory=4096, timeout=600, volumes={DATA: volume})
+def odm_meta(job_id: str):
+    import os
+    import subprocess
+    from pathlib import Path
+
+    env = dict(os.environ, PATH="/usr/bin:" + os.environ.get("PATH", ""))
+    volume.reload()
+    out = Path(DATA) / "jobs" / job_id / "odm"
+    r = subprocess.run(["/usr/bin/python3", "-c", ODM_META_SCRIPT,
+                        str(out / "orthophoto.tif"), str(out / "dsm.tif"),
+                        str(out / "meta.json")], capture_output=True, text=True, env=env)
+    print(r.stdout, r.stderr, flush=True)
+    if (out / "meta.json").exists():
+        volume.commit()
+        _set(job_id, odm_files=sorted(p.name for p in out.iterdir()))
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +370,7 @@ def web():
 
     @api.get("/api/version")
     def version():
-        return {"marker": "v-odm-1", "autoframe_in_page": "autoFrame" in PAGE}
+        return {"marker": "v-reg-1", "autoframe_in_page": "autoFrame" in PAGE}
 
     @api.get("/api/jobs")
     def list_jobs():
@@ -371,7 +423,7 @@ def web():
     @api.get("/api/jobs/{job_id}/odm/{fname}")
     def odm_file(job_id: str, fname: str):
         allowed = {"orthophoto.png": "image/png", "orthophoto.tif": "image/tiff",
-                   "hillshade.png": "image/png",
+                   "hillshade.png": "image/png", "meta.json": "application/json",
                    "dsm.tif": "image/tiff", "mesh.zip": "application/zip"}
         if fname not in allowed:
             return JSONResponse({"error": "unknown file"}, status_code=404)
@@ -380,6 +432,37 @@ def web():
         if not path.exists():
             return JSONResponse({"error": "not ready"}, status_code=404)
         return FileResponse(path, media_type=allowed[fname], filename=f"{job_id}-{fname}")
+
+    @api.post("/api/jobs/{job_id}/odm/meta")
+    def gen_odm_meta(job_id: str):
+        rec = jobs.get(job_id)
+        if rec is None:
+            return JSONResponse({"error": "unknown job"}, status_code=404)
+        if rec.get("odm_status") != "done":
+            return JSONResponse({"error": "map layer not built yet"}, status_code=409)
+        odm_meta.spawn(job_id)
+        return {"ok": True}
+
+    @api.post("/api/jobs/{job_id}/registration")
+    async def save_registration(job_id: str, payload: dict):
+        import math
+        if jobs.get(job_id) is None:
+            return JSONResponse({"error": "unknown job"}, status_code=404)
+        try:
+            scale = float(payload["scale"])
+            q = [float(x) for x in payload["q"]]
+            t = [float(x) for x in payload["t"]]
+            rmse = float(payload.get("rmse", 0.0))
+            n = int(payload.get("n", 0))
+            ok = (scale > 0 and len(q) == 4 and len(t) == 3
+                  and all(map(math.isfinite, q + t + [scale, rmse])))
+        except (KeyError, TypeError, ValueError):
+            ok = False
+        if not ok:
+            return JSONResponse({"error": "invalid registration"}, status_code=400)
+        _set(job_id, registration={"scale": scale, "q": q, "t": t,
+                                   "rmse": rmse, "n": n, "created": time.time()})
+        return {"ok": True}
 
     return api
 
@@ -434,8 +517,12 @@ h2{font-size:15px;font-weight:500;color:var(--dim);text-transform:uppercase;
   border:1px solid var(--line);border-radius:8px;padding:7px 14px;cursor:pointer;text-decoration:none}
 .job a:hover,.job button.view:hover,.job button.act:hover{border-color:var(--iris);color:var(--iris)}
 /* blueprint overlay */
-#bpwrap{display:none;position:fixed;inset:0;z-index:30;background:var(--ink);overflow:auto}
-#bpwrap img{display:block;margin:0 auto;max-width:calc(100vw - 28px);height:auto;padding:64px 0 20px}
+#bpwrap{display:none;position:fixed;inset:0;z-index:30;background:var(--ink);overflow:auto;text-align:center}
+#bpcanvas{position:relative;display:inline-block;margin-top:64px}
+#bpwrap img{display:block;max-width:calc(100vw - 28px);height:auto}
+.regdot{position:absolute;width:18px;height:18px;border-radius:50%;transform:translate(-50%,-50%);
+  font:600 11px 'IBM Plex Mono',monospace;color:#0b0e14;display:flex;align-items:center;
+  justify-content:center;pointer-events:none;border:1px solid rgba(0,0,0,.45)}
 #bpbar{position:fixed;top:14px;left:14px;z-index:2;display:flex;gap:8px;align-items:center;
   background:rgba(13,17,26,.82);border:1px solid var(--line);border-radius:12px;padding:9px 12px;
   backdrop-filter:blur(6px);font-family:'IBM Plex Mono',monospace;font-size:12px;max-width:calc(100vw - 28px);flex-wrap:wrap}
@@ -490,10 +577,14 @@ h2{font-size:15px;font-weight:500;color:var(--dim);text-transform:uppercase;
 </div>
 
 <div id="bpwrap">
-  <img id="bpimg" alt="orthophoto"/>
+  <div id="bpcanvas"><img id="bpimg" alt="orthophoto"/></div>
   <div id="bpbar">
     <span class="vname" id="bpname"></span>
     <button id="bpmode" title="Toggle orthophoto / elevation relief">Relief</button>
+    <button id="bpreg" title="Mark the map spots matching your numbered 3D points (in order)">Register</button>
+    <button id="bpalign" title="Compute the splat-to-map alignment from the point pairs">Align</button>
+    <button id="bpclearpts" title="Clear all registration points">Clear pts</button>
+    <span id="bpread"></span>
     <a id="bpdsm" href="#" title="Elevation model GeoTIFF">DSM .tif</a>
     <button id="bpclose">Close</button>
   </div>
@@ -507,6 +598,7 @@ h2{font-size:15px;font-weight:500;color:var(--dim);text-transform:uppercase;
     <button id="vflip" title="Model upside down? Flip the camera's up axis">Flip up-axis</button>
     <button id="vfly" title="Free-fly camera: WASD + mouse look, E/Q up/down, Shift fast, scroll = speed, Esc exits">Fly</button>
     <button id="vmeasure" title="Click two points on the model to measure the distance">Measure</button>
+    <button id="vreg" title="Registration: click 3-5 distinctive spots, then mark the same spots on the Blueprint">Register</button>
     <span id="vread"></span>
     <span id="vcal" style="display:none">
       <input id="vcalin" type="number" min="0" step="any" placeholder="real length (m)"/>
@@ -552,6 +644,7 @@ file.addEventListener('change', () => upload(file.files[0]));
 drop.addEventListener('drop', e => upload(e.dataTransfer.files[0]));
 
 // ---------- job list ----------
+const recs = {};   // latest job records by id (refreshed every poll)
 function esc(s){ const d=document.createElement('div'); d.textContent=s||''; return d.innerHTML; }
 function fmtElapsed(rec){
   if(!rec.started) return '';
@@ -562,6 +655,7 @@ function fmtElapsed(rec){
 async function refresh(){
   try{
     const list = await (await fetch('/api/jobs')).json();
+    list.forEach(r => { recs[r.job_id] = r; });
     const box = $('jobs');
     if(!list.length){ box.innerHTML = '<div id="empty">Nothing yet. Your finished models appear here \u2014 they stay saved between visits.</div>'; return; }
     box.innerHTML = list.map(r => {
@@ -613,8 +707,38 @@ async function startOdm(id, file){
   refresh();
 }
 
-let bpMode = 'orthophoto';
+let bpMode = 'orthophoto', bpMeta = null, bpMetaJob = null, regOnBp = false, regBpJob = null;
+
+function bpRead(t){ $('bpread').textContent = t; }
+function bpDotsVisible(v){ document.querySelectorAll('#bpcanvas .regdot').forEach(d => d.style.display = v ? 'flex' : 'none'); }
+function bpAddDot(u, v, i){
+  const d = document.createElement('div');
+  d.className = 'regdot'; d.textContent = i + 1;
+  d.style.background = REGC[i % REGC.length];
+  d.style.left = (u * 100) + '%'; d.style.top = (v * 100) + '%';
+  $('bpcanvas').appendChild(d);
+}
+
+async function fetchBpMeta(id){
+  bpMeta = null; bpMetaJob = id;
+  for(let i = 0; i < 20; i++){
+    if(bpMetaJob !== id) return;           // closed or switched job
+    const r = await fetch(`/api/jobs/${id}/odm/meta.json`);
+    if(r.ok){ bpMeta = await r.json(); bpRead(''); return; }
+    if(i === 0){
+      bpRead('preparing map metadata…');
+      await fetch(`/api/jobs/${id}/odm/meta`, {method:'POST'});
+    }
+    await new Promise(res => setTimeout(res, 3000));
+  }
+  bpRead('map metadata unavailable');
+}
+
 function openBlueprint(id, name){
+  if(regJob && regJob !== id){ clearRegState(); }
+  document.querySelectorAll('#bpcanvas .regdot').forEach(d => d.remove());
+  if(regBpJob !== id){ regOdm = []; regOdmUV = []; regBpJob = id; }
+  else regOdmUV.forEach((uv, i) => bpAddDot(uv[0], uv[1], i));
   bpMode = 'orthophoto';
   $('bpwrap').dataset.id = id;
   $('bpname').textContent = (name || id) + ' — orthophoto';
@@ -622,6 +746,7 @@ function openBlueprint(id, name){
   $('bpdsm').href = `/api/jobs/${id}/odm/dsm.tif`;
   $('bpmode').textContent = 'Relief';
   $('bpwrap').style.display = 'block';
+  fetchBpMeta(id);
 }
 $('bpmode').addEventListener('click', () => {
   const id = $('bpwrap').dataset.id;
@@ -629,8 +754,128 @@ $('bpmode').addEventListener('click', () => {
   $('bpimg').src = `/api/jobs/${id}/odm/${bpMode}.png`;
   $('bpname').textContent = $('bpname').textContent.replace(/— .*$/, '— ' + (bpMode === 'orthophoto' ? 'orthophoto' : 'elevation relief'));
   $('bpmode').textContent = bpMode === 'orthophoto' ? 'Relief' : 'Ortho';
+  bpDotsVisible(bpMode === 'orthophoto');   // dots are ortho-frame only
 });
-$('bpclose').addEventListener('click', () => { $('bpwrap').style.display = 'none'; $('bpimg').removeAttribute('src'); });
+$('bpclose').addEventListener('click', () => { $('bpwrap').style.display = 'none'; $('bpimg').removeAttribute('src'); bpMetaJob = null; });
+
+// -- registration: map-side point picking
+function setBpReg(on){
+  regOnBp = on;
+  $('bpreg').classList.toggle('on', on);
+  if(on){
+    if(bpMode !== 'orthophoto') $('bpmode').click();
+    bpRead(`mark your numbered 3D points on the map, in order (3D: ${regSplat.length} / map: ${regOdm.length})`);
+  } else bpRead('');
+}
+$('bpreg').addEventListener('click', () => setBpReg(!regOnBp));
+
+function dsmElev(X, Y){
+  const d = bpMeta.dsm, gw = d.grid_size[0], gh = d.grid_size[1], gt = d.gt;
+  const u = ((X - gt[0]) / gt[1]) * gw / d.size[0], v = ((Y - gt[3]) / gt[5]) * gh / d.size[1];
+  const iu = Math.floor(u), iv = Math.floor(v), cand = [];
+  for(let dv = 0; dv <= 1; dv++) for(let du = 0; du <= 1; du++){
+    const gx = iu + du, gy = iv + dv;
+    if(gx >= 0 && gx < gw && gy >= 0 && gy < gh && d.grid[gy][gx] != null)
+      cand.push({z: d.grid[gy][gx], w: Math.max((1 - Math.abs(u - gx)) * (1 - Math.abs(v - gy)), 1e-6)});
+  }
+  if(!cand.length) return null;
+  const tw = cand.reduce((a, c) => a + c.w, 0);
+  return cand.reduce((a, c) => a + c.z * c.w, 0) / tw;
+}
+
+$('bpimg').addEventListener('click', e => {
+  if(!regOnBp || bpMode !== 'orthophoto') return;
+  if(!bpMeta){ bpRead('map metadata still loading…'); return; }
+  if(regOdm.length >= 5){ bpRead('5 points max — Align or Clear pts'); return; }
+  const rect = $('bpimg').getBoundingClientRect();
+  const u = (e.clientX - rect.left) / rect.width, v = (e.clientY - rect.top) / rect.height;
+  const gt = bpMeta.ortho.gt, ow = bpMeta.ortho.size[0], oh = bpMeta.ortho.size[1];
+  const X = gt[0] + u * ow * gt[1] + v * oh * gt[2];
+  const Y = gt[3] + u * ow * gt[4] + v * oh * gt[5];
+  const Z = dsmElev(X, Y);
+  if(Z == null){ bpRead('no elevation data at that spot — click nearer the model'); return; }
+  regOdm.push([X, Y, Z]); regOdmUV.push([u, v]); regBpJob = $('bpwrap').dataset.id;
+  bpAddDot(u, v, regOdm.length - 1);
+  bpRead(`map point ${regOdm.length} set (3D: ${regSplat.length} / map: ${regOdm.length})`);
+});
+
+$('bpalign').addEventListener('click', async () => {
+  const id = $('bpwrap').dataset.id;
+  if(regJob && regJob !== id){ bpRead('3D points belong to a different job — Clear pts'); return; }
+  const n = Math.min(regSplat.length, regOdm.length);
+  if(n < 3){ bpRead(`need ≥3 pairs (3D: ${regSplat.length} / map: ${regOdm.length})`); return; }
+  const r = horn(regSplat.slice(0, n), regOdm.slice(0, n));
+  if(!r){ bpRead('degenerate points — pick spread-out, non-collinear spots'); return; }
+  const resp = await fetch(`/api/jobs/${id}/registration`, {method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({scale: r.scale, q: r.q, t: r.t, rmse: r.rmse, n})});
+  if(!resp.ok){ bpRead('failed to save alignment'); return; }
+  if(recs[id]) recs[id].registration = r;
+  bpRead(`aligned ✓ scale ${r.scale.toFixed(3)} map-u/u · RMSE ${r.rmse.toFixed(2)} map-u · ${n} pairs`);
+  setBpReg(false);
+});
+$('bpclearpts').addEventListener('click', () => { clearRegState(); bpRead(''); setRead(''); });
+
+function clearRegState(){
+  regSplat = []; regOdm = []; regOdmUV = []; regJob = null; regBpJob = null;
+  document.querySelectorAll('#bpcanvas .regdot').forEach(d => d.remove());
+  if(regGroup) regGroup.clear();
+}
+
+// -- Horn's closed-form absolute orientation (quaternion, with scale)
+function qRot(q, p){
+  const w = q[0], x = q[1], y = q[2], z = q[3], px = p[0], py = p[1], pz = p[2];
+  const uvx = y*pz - z*py, uvy = z*px - x*pz, uvz = x*py - y*px;
+  const uuvx = y*uvz - z*uvy, uuvy = z*uvx - x*uvz, uuvz = x*uvy - y*uvx;
+  return [px + 2*(w*uvx + uuvx), py + 2*(w*uvy + uuvy), pz + 2*(w*uvz + uuvz)];
+}
+function horn(src, dst){
+  const n = src.length;
+  const cs = [0,0,0], cd = [0,0,0];
+  for(const p of src){ cs[0] += p[0]/n; cs[1] += p[1]/n; cs[2] += p[2]/n; }
+  for(const p of dst){ cd[0] += p[0]/n; cd[1] += p[1]/n; cd[2] += p[2]/n; }
+  const S = [[0,0,0],[0,0,0],[0,0,0]];
+  let varS = 0;
+  for(let i = 0; i < n; i++){
+    const a = [src[i][0]-cs[0], src[i][1]-cs[1], src[i][2]-cs[2]];
+    const b = [dst[i][0]-cd[0], dst[i][1]-cd[1], dst[i][2]-cd[2]];
+    varS += a[0]*a[0] + a[1]*a[1] + a[2]*a[2];
+    for(let j = 0; j < 3; j++) for(let k = 0; k < 3; k++) S[j][k] += a[j]*b[k];
+  }
+  if(varS < 1e-12) return null;
+  const Sxx=S[0][0], Sxy=S[0][1], Sxz=S[0][2], Syx=S[1][0], Syy=S[1][1], Syz=S[1][2], Szx=S[2][0], Szy=S[2][1], Szz=S[2][2];
+  const N = [
+    [Sxx+Syy+Szz, Syz-Szy,      Szx-Sxz,      Sxy-Syx],
+    [Syz-Szy,     Sxx-Syy-Szz,  Sxy+Syx,      Szx+Sxz],
+    [Szx-Sxz,     Sxy+Syx,     -Sxx+Syy-Szz,  Syz+Szy],
+    [Sxy-Syx,     Szx+Sxz,      Syz+Szy,     -Sxx-Syy+Szz]];
+  let c = 0;
+  for(const row of N) c = Math.max(c, row.reduce((a, v) => a + Math.abs(v), 0));
+  let q = [1, 0.001, 0.002, 0.003];  // asymmetric start so power iteration can't stall
+  for(let it = 0; it < 200; it++){
+    const r = [0,0,0,0];
+    for(let j = 0; j < 4; j++){ r[j] = c*q[j]; for(let k = 0; k < 4; k++) r[j] += N[j][k]*q[k]; }
+    const m = Math.hypot(r[0], r[1], r[2], r[3]);
+    if(m < 1e-15) return null;
+    q = [r[0]/m, r[1]/m, r[2]/m, r[3]/m];
+  }
+  let num = 0;
+  for(let i = 0; i < n; i++){
+    const a = qRot(q, [src[i][0]-cs[0], src[i][1]-cs[1], src[i][2]-cs[2]]);
+    num += a[0]*(dst[i][0]-cd[0]) + a[1]*(dst[i][1]-cd[1]) + a[2]*(dst[i][2]-cd[2]);
+  }
+  const s = num / varS;
+  if(!(s > 0) || !isFinite(s)) return null;
+  const rc = qRot(q, cs);
+  const t = [cd[0]-s*rc[0], cd[1]-s*rc[1], cd[2]-s*rc[2]];
+  let se = 0;
+  for(let i = 0; i < n; i++){
+    const p = qRot(q, src[i]);
+    const dx = s*p[0]+t[0]-dst[i][0], dy = s*p[1]+t[1]-dst[i][1], dz = s*p[2]+t[2]-dst[i][2];
+    se += dx*dx + dy*dy + dz*dz;
+  }
+  return {scale: s, q, t, rmse: Math.sqrt(se/n)};
+}
 
 // ---------- viewer ----------
 let viewer = null, vJob = null, vName = null, flipped = false;
@@ -663,7 +908,9 @@ async function openViewer(jobId, name, keepFlip=false){
   $('vprogress').style.display = 'block';
   $('vname').textContent = name || jobId;
   if(flyOn) setFly(false);
-  setMeasure(false); markGroup = null; mPts = []; lastDist = null; setRead('');
+  setMeasure(false); setReg3d(false);
+  markGroup = null; regGroup = null; mPts = []; lastDist = null; setRead('');
+  if(regJob && regJob !== jobId){ regSplat = []; regOdm = []; regOdmUV = []; regJob = null; }
   if(viewer){ try{ await viewer.dispose(); }catch(e){} viewer = null; }
   $('viewer').replaceChildren();
   viewer = new GS.Viewer({
@@ -679,7 +926,11 @@ async function openViewer(jobId, name, keepFlip=false){
       onProgress: (p,l) => { $('vprogress').textContent = `${l||'loading'} ${Math.round(p)}%`; },
     });
     try{ autoFrame(); }catch(e){ console.log('auto-frame failed:', e); }
-    if(viewer.threeScene){ markGroup = new THREE.Group(); viewer.threeScene.add(markGroup); }
+    if(viewer.threeScene){
+      markGroup = new THREE.Group(); regGroup = new THREE.Group();
+      viewer.threeScene.add(markGroup); viewer.threeScene.add(regGroup);
+      if(regJob === jobId) regSplat.forEach((pt, i) => addRegMark(new THREE.Vector3(pt[0], pt[1], pt[2]), i));
+    }
     viewer.start();
     $('vprogress').style.display = 'none';
   }catch(e){ $('vprogress').textContent = 'Failed to load model: ' + (e.message||e); }
@@ -694,6 +945,8 @@ $('vflip').addEventListener('click', () => { if(vJob){ flipped = !flipped; openV
 let flyOn = false, measureOn = false, savedControls = null;
 let coreRadius = 4, flySpeed = 2, flyLastT = 0;
 let markGroup = null, mPts = [], lastDist = null;
+let regGroup = null, regSplat = [], regOdm = [], regOdmUV = [], regJob = null, regOn3d = false;
+const REGC = ['#9d8cff', '#6fd08c', '#e8909f', '#e8ebf2', '#f0b06a'];
 const keys = {};
 
 function setRead(t){ $('vread').textContent = t; }
@@ -702,8 +955,13 @@ function getScale(){
   return (isFinite(v) && v > 0) ? v : null;
 }
 function fmtDist(d){
+  const reg = (recs[vJob] || {}).registration;
+  let out = d.toFixed(2) + ' u';
+  if(reg && reg.scale > 0) out += ` = ${(d*reg.scale).toFixed(2)} map-u`;
   const s = getScale();
-  return d.toFixed(2) + ' units' + (s ? ` = ${(d*s).toFixed(2)} m` : ' (uncalibrated)');
+  if(s) out += ` = ${(d*s).toFixed(2)} m`;
+  if(!reg && !s) out += ' (uncalibrated)';
+  return out;
 }
 
 // -- fly: detach OrbitControls (its update() overwrites external camera moves)
@@ -713,6 +971,7 @@ function setFly(on){
   $('vfly').classList.toggle('on', on);
   if(on){
     setMeasure(false);
+    setReg3d(false);
     savedControls = viewer.controls;
     viewer.controls = null;
     const el = viewer.renderer && viewer.renderer.domElement;
@@ -776,8 +1035,27 @@ document.addEventListener('wheel', e => {
 function setMeasure(on){
   measureOn = on;
   $('vmeasure').classList.toggle('on', on);
-  if(on){ if(flyOn) setFly(false); clearMarks(); setRead('click the first point on the model'); }
-  else { clearMarks(); setRead(''); }
+  if(on){ if(flyOn) setFly(false); if(regOn3d) setReg3d(false); clearMarks(); setRead('click the first point on the model'); }
+  else { clearMarks(); if(!regOn3d) setRead(''); }
+}
+
+// -- registration: splat-side point picking
+function setReg3d(on){
+  if(regOn3d === on) return;
+  regOn3d = on;
+  $('vreg').classList.toggle('on', on);
+  if(on){
+    if(flyOn) setFly(false);
+    if(measureOn) setMeasure(false);
+    setRead(`registration: click 3–5 distinctive spots on the model (have ${regSplat.length}), then mark them on the Blueprint in the same order`);
+  } else if(!measureOn) setRead('');
+}
+$('vreg').addEventListener('click', () => setReg3d(!regOn3d));
+function addRegMark(p, i){
+  if(!regGroup) return;
+  const s = new THREE.Mesh(new THREE.SphereGeometry(coreRadius*0.014, 16, 16),
+                           new THREE.MeshBasicMaterial({color: REGC[i % REGC.length]}));
+  s.position.copy(p); regGroup.add(s);
 }
 function clearMarks(){
   mPts = []; lastDist = null;
@@ -802,22 +1080,31 @@ function pickPoint(e){
 let mDown = null;
 $('viewer').addEventListener('mousedown', e => { mDown = [e.clientX, e.clientY]; }, true);
 $('viewer').addEventListener('mouseup', e => {
-  if(!measureOn || flyOn || !viewer) return;
+  if((!measureOn && !regOn3d) || flyOn || !viewer) return;
   if(mDown && Math.hypot(e.clientX - mDown[0], e.clientY - mDown[1]) > 5) return;  // was a drag
-  e.stopPropagation();  // keep the viewer's click-to-refocus out of measure clicks
+  e.stopPropagation();  // keep the viewer's click-to-refocus out of picking clicks
   const p = pickPoint(e);
   if(!p){ setRead('no surface under cursor — click on the model'); return; }
-  if(mPts.length === 2) clearMarks();
-  mPts.push(p); addMark(p);
-  if(mPts.length === 2){
-    lastDist = mPts[0].distanceTo(mPts[1]);
-    if(markGroup){
-      const g = new THREE.BufferGeometry().setFromPoints(mPts);
-      markGroup.add(new THREE.Line(g, new THREE.LineBasicMaterial({color: 0x9d8cff})));
-    }
-    setRead(fmtDist(lastDist));
-    $('vcal').style.display = '';
-  }else setRead('point 1 set — click the second point');
+  if(measureOn){
+    if(mPts.length === 2) clearMarks();
+    mPts.push(p); addMark(p);
+    if(mPts.length === 2){
+      lastDist = mPts[0].distanceTo(mPts[1]);
+      if(markGroup){
+        const g = new THREE.BufferGeometry().setFromPoints(mPts);
+        markGroup.add(new THREE.Line(g, new THREE.LineBasicMaterial({color: 0x9d8cff})));
+      }
+      setRead(fmtDist(lastDist));
+      $('vcal').style.display = '';
+    }else setRead('point 1 set — click the second point');
+  }else{
+    if(regJob && regJob !== vJob){ setRead('registration points from another job pending — Clear pts in the Blueprint'); return; }
+    if(regSplat.length >= 5){ setRead('5 points max — open the Blueprint to mark them and Align'); return; }
+    regJob = vJob;
+    regSplat.push([p.x, p.y, p.z]);
+    addRegMark(p, regSplat.length - 1);
+    setRead(`3D point ${regSplat.length} set (map: ${regOdm.length}) — mark the same spot on the Blueprint`);
+  }
 }, true);
 $('vmeasure').addEventListener('click', () => setMeasure(!measureOn));
 $('vcalok').addEventListener('click', () => {
