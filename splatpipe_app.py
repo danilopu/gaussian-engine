@@ -51,7 +51,11 @@ gpu_image = (
 # added for frame extraction.
 odm_image = (
     modal.Image.from_registry("opendronemap/odm:3.5.6", add_python="3.11")
-    .apt_install("ffmpeg")
+    # the ODM image's ENTRYPOINT (python3 /code/run.py) would run at container
+    # boot under Modal's injected python and crash-loop; clear it
+    .entrypoint([])
+    # gdal-bin: ODM's own gdal utilities live off-PATH in SuperBuild/install/bin
+    .apt_install("ffmpeg", "gdal-bin")
 )
 
 web_image = modal.Image.debian_slim(python_version="3.12").pip_install(
@@ -222,8 +226,10 @@ def process_odm(job_id: str):
             "-q:v", "2", str(images / "frame_%04d.jpg"),
         ])
 
+        # ODM's deps live in the image's system python; Modal's injected
+        # python3 shadows it on PATH, so the interpreter must be explicit
         run("photogrammetry (ODM)", [
-            "python3", "/code/run.py", "--project-path", str(work), "proj",
+            "/usr/bin/python3", "/code/run.py", "--project-path", str(work), "proj",
             "--dsm", "--orthophoto-png", "--skip-report",
             "--max-concurrency", "8",
         ])
