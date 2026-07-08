@@ -58,6 +58,15 @@ odm_image = (
     .apt_install("ffmpeg", "gdal-bin")
 )
 
+# CPU-only image for turning a splat .ply into walkable meshes (open3d Poisson)
+mesh_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("libgl1", "libgomp1", "libx11-6", "libegl1")
+    # trimesh does the GLB export: open3d's writer emits corrupt buffer views
+    # for uint16-indexed (decimated) meshes
+    .pip_install("open3d==0.19.0", "plyfile", "numpy", "trimesh")
+)
+
 web_image = modal.Image.debian_slim(python_version="3.12").pip_install(
     "fastapi[standard]==0.115.*"
 )
@@ -314,6 +323,81 @@ def process_odm(job_id: str):
         raise
 
 
+# ---------------------------------------------------------------------------
+# Walk-mesh builder (CPU): gaussian centers -> Poisson surface -> mesh.glb
+# (vertex colors, for Blender/Unity) + collision.glb (decimated, for physics
+# and the in-browser Walk mode). Tuning constants:
+# ---------------------------------------------------------------------------
+MESH_OPACITY_MIN = 0.3        # drop near-transparent gaussians (floaters/haze)
+MESH_SCALE_PCTL = 98          # drop gaussians bigger than this scale percentile
+MESH_POISSON_DEPTH = 10       # Poisson octree depth; 9 = coarser/faster
+MESH_DENSITY_QUANTILE = 0.06  # trim the sparsest Poisson vertices (halo)
+COLLISION_TARGET_TRIS = 50_000  # decimation target for the physics mesh
+
+
+@app.function(image=mesh_image, cpu=8, memory=8192, timeout=1800, volumes={DATA: volume})
+def build_walk_mesh(job_id: str):
+    import numpy as np
+    import open3d as o3d
+    from pathlib import Path
+    from plyfile import PlyData
+
+    volume.reload()
+    job_dir = Path(DATA) / "jobs" / job_id
+    try:
+        _set(job_id, mesh_status="running", mesh_stage="loading splat")
+        v = PlyData.read(str(job_dir / "model.ply"))["vertex"]
+        xyz = np.column_stack([v["x"], v["y"], v["z"]]).astype(np.float64)
+        opa = 1.0 / (1.0 + np.exp(-np.asarray(v["opacity"], dtype=np.float64)))
+        scales = np.exp(np.column_stack([v["scale_0"], v["scale_1"], v["scale_2"]])).max(axis=1)
+        SH0 = 0.28209479177387814
+        rgb = np.clip(0.5 + SH0 * np.column_stack([v["f_dc_0"], v["f_dc_1"], v["f_dc_2"]]), 0, 1)
+        keep = (opa > MESH_OPACITY_MIN) & (scales < np.percentile(scales, MESH_SCALE_PCTL))
+        print(f"splats: {len(xyz)}, kept after floater filter: {int(keep.sum())}", flush=True)
+        xyz, rgb = xyz[keep], rgb[keep]
+
+        _set(job_id, mesh_stage=f"poisson meshing {int(keep.sum()):,} points")
+        pc = o3d.geometry.PointCloud()
+        pc.points = o3d.utility.Vector3dVector(xyz)
+        pc.colors = o3d.utility.Vector3dVector(rgb)
+        pc.estimate_normals(o3d.geometry.KDTreeSearchParamKNN(20))
+        pc.orient_normals_consistent_tangent_plane(15)
+        mesh, dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+            pc, depth=MESH_POISSON_DEPTH)
+        dens = np.asarray(dens)
+        mesh.remove_vertices_by_mask(dens < np.quantile(dens, MESH_DENSITY_QUANTILE))
+        clusters, counts, _ = mesh.cluster_connected_triangles()
+        mesh.remove_triangles_by_mask(np.asarray(clusters) != int(np.argmax(counts)))
+        mesh.remove_unreferenced_vertices()
+        mesh.compute_vertex_normals()
+        full_tris = len(mesh.triangles)
+        print(f"poisson mesh: {full_tris} triangles", flush=True)
+
+        _set(job_id, mesh_stage="exporting mesh.glb + collision.glb")
+        import trimesh
+
+        def export_glb(m, path, colors):
+            kw = {}
+            if colors and len(m.vertex_colors):
+                kw["vertex_colors"] = (np.asarray(m.vertex_colors) * 255).astype(np.uint8)
+            trimesh.Trimesh(vertices=np.asarray(m.vertices),
+                            faces=np.asarray(m.triangles), process=False, **kw).export(path)
+
+        export_glb(mesh, str(job_dir / "mesh.glb"), colors=True)
+        col = mesh.simplify_quadric_decimation(COLLISION_TARGET_TRIS) \
+            if full_tris > COLLISION_TARGET_TRIS else mesh
+        col.remove_unreferenced_vertices()
+        export_glb(col, str(job_dir / "collision.glb"), colors=False)  # physics mesh: no colors
+        volume.commit()
+        _set(job_id, mesh_status="done", mesh_stage="done",
+             mesh_tris=full_tris, collision_tris=len(col.triangles),
+             mesh_mb=round((job_dir / "mesh.glb").stat().st_size / 1e6, 1))
+    except Exception as e:
+        volume.commit()
+        _set(job_id, mesh_status="error", mesh_error=str(e))
+        raise
+
+
 # Backfill map metadata for ODM runs made before meta.json existed
 @app.function(image=odm_image, cpu=2, memory=4096, timeout=600, volumes={DATA: volume})
 def odm_meta(job_id: str):
@@ -370,7 +454,7 @@ def web():
 
     @api.get("/api/version")
     def version():
-        return {"marker": "v-reg-1", "autoframe_in_page": "autoFrame" in PAGE}
+        return {"marker": "v-walk-1", "autoframe_in_page": "autoFrame" in PAGE}
 
     @api.get("/api/jobs")
     def list_jobs():
@@ -429,6 +513,31 @@ def web():
             return JSONResponse({"error": "unknown file"}, status_code=404)
         volume.reload()
         path = Path(DATA) / "jobs" / job_id / "odm" / fname
+        if not path.exists():
+            return JSONResponse({"error": "not ready"}, status_code=404)
+        return FileResponse(path, media_type=allowed[fname], filename=f"{job_id}-{fname}")
+
+    @api.post("/api/jobs/{job_id}/mesh")
+    def start_mesh(job_id: str):
+        rec = jobs.get(job_id)
+        if rec is None:
+            return JSONResponse({"error": "unknown job"}, status_code=404)
+        if rec.get("mesh_status") in ("queued", "running"):
+            return {"job_id": job_id, "mesh_status": rec["mesh_status"]}
+        volume.reload()
+        if not (Path(DATA) / "jobs" / job_id / "model.ply").exists():
+            return JSONResponse({"error": "model not ready"}, status_code=409)
+        _set(job_id, mesh_status="queued", mesh_stage="waiting for worker", mesh_error="")
+        build_walk_mesh.spawn(job_id)
+        return {"job_id": job_id, "mesh_status": "queued"}
+
+    @api.get("/api/jobs/{job_id}/mesh/{fname}")
+    def mesh_file(job_id: str, fname: str):
+        allowed = {"mesh.glb": "model/gltf-binary", "collision.glb": "model/gltf-binary"}
+        if fname not in allowed:
+            return JSONResponse({"error": "unknown file"}, status_code=404)
+        volume.reload()
+        path = Path(DATA) / "jobs" / job_id / fname
         if not path.exists():
             return JSONResponse({"error": "not ready"}, status_code=404)
         return FileResponse(path, media_type=allowed[fname], filename=f"{job_id}-{fname}")
@@ -597,6 +706,7 @@ h2{font-size:15px;font-weight:500;color:var(--dim);text-transform:uppercase;
     <span class="vname" id="vname"></span>
     <button id="vflip" title="Model upside down? Flip the camera's up axis">Flip up-axis</button>
     <button id="vfly" title="Free-fly camera: WASD + mouse look, E/Q up/down, Shift fast, scroll = speed, Esc exits">Fly</button>
+    <button id="vwalk" title="Walk on the model: WASD + mouse look, Shift run, Space jump, scroll = eye height, Esc exits. Builds a walk mesh on first use (~2 min)">Walk</button>
     <button id="vmeasure" title="Click two points on the model to measure the distance">Measure</button>
     <button id="vreg" title="Registration: click 3-5 distinctive spots, then mark the same spots on the Blueprint">Register</button>
     <span id="vread"></span>
@@ -611,12 +721,19 @@ h2{font-size:15px;font-weight:500;color:var(--dim);text-transform:uppercase;
 <script type="importmap">
 {"imports":{
   "three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+  "three-mesh-bvh":"https://cdn.jsdelivr.net/npm/three-mesh-bvh@0.7.8/build/index.module.js",
   "@mkkellogg/gaussian-splats-3d":"https://cdn.jsdelivr.net/npm/@mkkellogg/gaussian-splats-3d@0.4.7/build/gaussian-splats-3d.module.js"
 }}
 </script>
 <script type="module">
 import * as THREE from 'three';
 import * as GS from '@mkkellogg/gaussian-splats-3d';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh';
+THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
+THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
+THREE.Mesh.prototype.raycast = acceleratedRaycast;
 
 const $ = (id) => document.getElementById(id);
 const drop = $('drop'), file = $('file'), upstate = $('upstate');
@@ -665,6 +782,9 @@ async function refresh(){
       const os = r.odm_status;
       if(os==='queued'||os==='running') stage += `\nmap layer: ${r.odm_stage||os}${r.odm_log?'\n'+r.odm_log:''}`;
       else if(os==='error') stage += `\nmap layer failed: ${r.odm_error||''}`;
+      const ms = r.mesh_status;
+      if(ms==='queued'||ms==='running') stage += `\nwalk mesh: ${r.mesh_stage||ms}`;
+      else if(ms==='error') stage += `\nwalk mesh failed: ${r.mesh_error||''}`;
       let act = '';
       if(st==='done'){
         act = `<button class="view" data-id="${r.job_id}" data-name="${esc(r.name)}">View in 3D</button>
@@ -908,6 +1028,8 @@ async function openViewer(jobId, name, keepFlip=false){
   $('vprogress').style.display = 'block';
   $('vname').textContent = name || jobId;
   if(flyOn) setFly(false);
+  if(walkOn) setWalk(false);
+  if(walkMeshJob !== jobId){ walkMesh = null; walkMeshJob = null; }
   setMeasure(false); setReg3d(false);
   markGroup = null; regGroup = null; mPts = []; lastDist = null; setRead('');
   if(regJob && regJob !== jobId){ regSplat = []; regOdm = []; regOdmUV = []; regJob = null; }
@@ -1008,11 +1130,152 @@ function flyTick(t){
   requestAnimationFrame(flyTick);
 }
 $('vfly').addEventListener('click', () => setFly(!flyOn));
+
+// -- walk: gravity + collision against a Poisson mesh built from the splat
+let walkOn = false, walkMesh = null, walkMeshJob = null, eyeH = 1, walkVel = 0, walkGrounded = false;
+const walkRay = new THREE.Raycaster();
+walkRay.firstHitOnly = true;   // three-mesh-bvh fast path
+
+async function ensureWalkMesh(id){
+  for(let i = 0; i < 90; i++){
+    if(vJob !== id) return false;                    // viewer switched jobs
+    const r = await fetch(`/api/jobs/${id}/mesh/collision.glb`);
+    if(r.ok){
+      const buf = await r.arrayBuffer();
+      const gltf = await new GLTFLoader().parseAsync(buf, '');
+      let found = null;
+      gltf.scene.updateMatrixWorld(true);
+      gltf.scene.traverse(o => { if(o.isMesh && !found) found = o; });
+      if(!found){ setRead('walk mesh file is empty'); return false; }
+      found.geometry.computeBoundsTree();
+      walkMesh = found; walkMeshJob = id;
+      return true;
+    }
+    if(i === 0){
+      const p = await fetch(`/api/jobs/${id}/mesh`, {method: 'POST'});
+      if(!p.ok){ setRead('cannot build walk mesh: ' + p.status); return false; }
+      setRead('building walk mesh on a CPU worker (~2 min)…');
+    }
+    const rec = recs[id] || {};
+    if(rec.mesh_status === 'error'){ setRead('walk mesh failed: ' + (rec.mesh_error || '')); return false; }
+    if(rec.mesh_stage && rec.mesh_status === 'running') setRead('walk mesh: ' + rec.mesh_stage);
+    await new Promise(res => setTimeout(res, 4000));
+  }
+  setRead('walk mesh timed out — try again');
+  return false;
+}
+
+function groundUnder(pos, up){
+  walkRay.set(pos.clone().addScaledVector(up, coreRadius), up.clone().negate());
+  walkRay.far = coreRadius * 5;
+  const hits = walkRay.intersectObject(walkMesh, false);
+  return hits.length ? hits[0].point : null;
+}
+
+async function startWalk(){
+  if(!viewer) return;
+  if(walkMeshJob !== vJob) walkMesh = null;
+  if(!walkMesh){
+    $('vwalk').disabled = true;
+    const ok = await ensureWalkMesh(vJob);
+    $('vwalk').disabled = false;
+    if(!ok) return;
+  }
+  setWalk(true);
+}
+function setWalk(on){
+  if(walkOn === on) return;
+  walkOn = on;
+  $('vwalk').classList.toggle('on', on);
+  if(on){
+    setMeasure(false); setReg3d(false); if(flyOn) setFly(false);
+    savedControls = viewer.controls;
+    viewer.controls = null;
+    const up = viewer.camera.up.clone().normalize();
+    eyeH = Math.max(coreRadius * 0.02, 1e-4);
+    walkVel = 0; walkGrounded = false;
+    const g = groundUnder(viewer.camera.position, up);
+    if(g) viewer.camera.position.copy(g).addScaledVector(up, eyeH);
+    const el = viewer.renderer && viewer.renderer.domElement;
+    if(el && el.requestPointerLock) el.requestPointerLock();
+    flyLastT = performance.now();
+    requestAnimationFrame(walkTick);
+    setRead('WASD walk · Shift run · Space jump · scroll eye height · Esc exit');
+  }else{
+    if(document.exitPointerLock && document.pointerLockElement) document.exitPointerLock();
+    if(viewer && savedControls){
+      viewer.controls = savedControls;
+      const fwd = new THREE.Vector3(0,0,-1).applyQuaternion(viewer.camera.quaternion);
+      viewer.controls.target.copy(viewer.camera.position).addScaledVector(fwd, Math.max(coreRadius*0.6, 0.1));
+      viewer.controls.update();
+    }
+    savedControls = null;
+    setRead('');
+  }
+}
+function walkTick(t){
+  if(!walkOn || !viewer || !walkMesh) return;
+  const dt = Math.min((t - flyLastT)/1000, 0.05); flyLastT = t;
+  const cam = viewer.camera;
+  const up = cam.up.clone().normalize();
+  let feet = cam.position.clone().addScaledVector(up, -eyeH);
+
+  // horizontal movement in the ground plane
+  const fwd = new THREE.Vector3(0,0,-1).applyQuaternion(cam.quaternion);
+  fwd.addScaledVector(up, -fwd.dot(up));
+  const right = new THREE.Vector3(1,0,0).applyQuaternion(cam.quaternion);
+  right.addScaledVector(up, -right.dot(up));
+  const v = new THREE.Vector3();
+  if(fwd.lengthSq() > 1e-8){ fwd.normalize(); if(keys['KeyW']) v.add(fwd); if(keys['KeyS']) v.sub(fwd); }
+  if(right.lengthSq() > 1e-8){ right.normalize(); if(keys['KeyD']) v.add(right); if(keys['KeyA']) v.sub(right); }
+  if(v.lengthSq() > 0){
+    const speed = eyeH * 2.2 * ((keys['ShiftLeft']||keys['ShiftRight']) ? 3 : 1);  // ~walking pace
+    v.normalize().multiplyScalar(speed * dt);
+    // wall check at chest height; slide along the surface if blocked
+    const chest = feet.clone().addScaledVector(up, eyeH * 0.55);
+    walkRay.set(chest, v.clone().normalize());
+    walkRay.far = v.length() + eyeH * 0.35;
+    const hit = walkRay.intersectObject(walkMesh, false)[0];
+    if(!hit) feet.add(v);
+    else if(hit.face){
+      const nrm = hit.face.normal.clone().transformDirection(walkMesh.matrixWorld);
+      const slide = v.clone().addScaledVector(nrm, -v.dot(nrm));
+      walkRay.set(chest, slide.clone().normalize());
+      walkRay.far = slide.length() + eyeH * 0.35;
+      if(slide.lengthSq() > 1e-12 && !walkRay.intersectObject(walkMesh, false).length) feet.add(slide);
+    }
+  }
+
+  // gravity + ground clamp (step up/down follows terrain when grounded)
+  if(keys['Space'] && walkGrounded){ walkVel = eyeH * 2.6; walkGrounded = false; }
+  const g = groundUnder(feet.clone().addScaledVector(up, eyeH * 0.5), up);
+  if(g){
+    const above = feet.clone().sub(g).dot(up);
+    if(walkGrounded && walkVel === 0 && above < eyeH * 0.6){
+      feet = g;                                   // follow terrain
+    }else{
+      walkVel -= eyeH * 7.5 * dt;                 // fall
+      feet.addScaledVector(up, walkVel * dt);
+      if(feet.clone().sub(g).dot(up) <= 0){ feet = g; walkVel = 0; walkGrounded = true; }
+      else walkGrounded = false;
+    }
+  }else{
+    walkVel = 0; walkGrounded = false;            // over the void: hover
+  }
+
+  cam.position.copy(feet).addScaledVector(up, eyeH);
+  requestAnimationFrame(walkTick);
+}
+$('vwalk').addEventListener('click', () => { walkOn ? setWalk(false) : startWalk(); });
+
 document.addEventListener('pointerlockchange', () => {
-  if(!document.pointerLockElement && flyOn) setFly(false);
+  if(!document.pointerLockElement){
+    if(flyOn) setFly(false);
+    if(walkOn) setWalk(false);
+  }
 });
 document.addEventListener('mousemove', e => {
-  if(!flyOn || !document.pointerLockElement || !viewer) return;
+  if(!(flyOn || walkOn) || !document.pointerLockElement || !viewer) return;
   const cam = viewer.camera;
   // yaw around the scene's visual up so the horizon stays level, pitch around local right
   const yaw = new THREE.Quaternion().setFromAxisAngle(cam.up, -e.movementX * 0.002);
@@ -1029,6 +1292,7 @@ document.addEventListener('keydown', e => {
 document.addEventListener('keyup', e => { keys[e.code] = false; });
 document.addEventListener('wheel', e => {
   if(flyOn) flySpeed = Math.max(0.01, flySpeed * (e.deltaY < 0 ? 1.25 : 0.8));
+  if(walkOn) eyeH = Math.max(1e-4, eyeH * (e.deltaY < 0 ? 1.12 : 0.9));
 }, {passive: true});
 
 // -- measure: pick splat surface points with the library's raycaster
