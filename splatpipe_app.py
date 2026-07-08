@@ -41,8 +41,9 @@ gpu_image = (
     # point them at gcc so nerfstudio's source deps (fpsample, pyliblzfse) build
     .env({"CC": "gcc", "CXX": "g++"})
     .pip_install("nerfstudio")
-    # gsplat compiles its CUDA kernels on first use; make sure it targets the T4
-    .env({"TORCH_CUDA_ARCH_LIST": "7.5"})
+    # gsplat compiles its CUDA kernels on first use; make sure it targets the T4.
+    # QT_QPA_PLATFORM keeps COLMAP's Qt happy on a headless container.
+    .env({"TORCH_CUDA_ARCH_LIST": "7.5", "QT_QPA_PLATFORM": "offscreen"})
 )
 
 web_image = modal.Image.debian_slim(python_version="3.12").pip_install(
@@ -106,6 +107,9 @@ def process_video(job_id: str):
             "--data", str(video),
             "--output-dir", str(job_dir / "proc"),
             "--num-frames-target", "150",
+            # apt COLMAP is CPU-only; GPU SIFT would try to open an OpenGL
+            # context on a headless box and abort
+            "--no-gpu",
         ], job_dir)
         volume.commit()
 
