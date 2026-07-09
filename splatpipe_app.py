@@ -158,6 +158,11 @@ def process_video(job_id: str):
             raise RuntimeError("export produced no .ply")
         shutil.copy(plys[-1], job_dir / "model.ply")
 
+        # keep the camera poses: paired with ODM's poses they give an exact
+        # automatic splat<->map registration (same source video)
+        if (job_dir / "proc" / "transforms.json").exists():
+            shutil.copy(job_dir / "proc" / "transforms.json", job_dir / "poses_splat.json")
+
         # free space: keep only the final model + a few debug bits.
         # The input video is kept so the ODM map layer can reuse it.
         for sub in ("proc", "outputs", "export"):
@@ -308,6 +313,15 @@ def process_odm(job_id: str):
         tex = proj / "odm_texturing"
         if tex.exists():
             shutil.make_archive(str(out / "mesh"), "zip", tex)
+        # keep camera poses + georeferencing transform for pose-based
+        # splat<->map auto-registration
+        recon = proj / "opensfm" / "reconstruction.json"
+        if recon.exists():
+            shutil.copy(recon, out / "reconstruction.json")
+        geo_dir = proj / "odm_georeferencing"
+        if geo_dir.exists():
+            for f in geo_dir.glob("*.txt"):
+                shutil.copy(f, out / f.name)
         if (out / "orthophoto.tif").exists() and (out / "dsm.tif").exists():
             subprocess.run(["/usr/bin/python3", "-c", ODM_META_SCRIPT,
                             str(out / "orthophoto.tif"), str(out / "dsm.tif"),
@@ -398,6 +412,116 @@ def build_walk_mesh(job_id: str):
         raise
 
 
+def _pose_registration(transforms: dict, recon: dict):
+    """Similarity transform (splat -> map) from the two pipelines' camera poses.
+
+    Both pipelines sampled frames evenly from the same video, so frame numbers
+    are a shared clock: pair each splat camera center with the map camera
+    whose normalized frame time is nearest, then solve Horn with scale.
+    Pure function so it can be unit-tested without Modal. Returns a dict
+    {scale,q,t,rmse,n} or raises ValueError.
+    """
+    import re
+
+    import numpy as np
+
+    def rodrigues(r):
+        r = np.asarray(r, dtype=float)
+        th = np.linalg.norm(r)
+        if th < 1e-12:
+            return np.eye(3)
+        k = r / th
+        K = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+        return np.eye(3) + np.sin(th) * K + (1 - np.cos(th)) * (K @ K)
+
+    def frame_no(name):
+        m = re.findall(r"(\d+)", name)
+        if not m:
+            raise ValueError(f"no frame number in {name!r}")
+        return int(m[-1])
+
+    s_pts, s_no = [], []
+    for f in transforms["frames"]:
+        m = np.asarray(f["transform_matrix"], dtype=float)
+        s_pts.append(m[:3, 3])
+        s_no.append(frame_no(f["file_path"]))
+    m_pts, m_no = [], []
+    for name, sh in recon["shots"].items():
+        R = rodrigues(sh["rotation"])
+        t = np.asarray(sh["translation"], dtype=float)
+        m_pts.append(-R.T @ t)
+        m_no.append(frame_no(name))
+    if len(s_pts) < 8 or len(m_pts) < 8:
+        raise ValueError(f"too few poses (splat {len(s_pts)}, map {len(m_pts)})")
+    S, M = np.asarray(s_pts), np.asarray(m_pts)
+    ts = np.asarray(s_no, float) / max(s_no)
+    tm = np.asarray(m_no, float) / max(m_no)
+
+    order = np.argsort(tm)
+    tm, M = tm[order], M[order]
+    j = np.searchsorted(tm, ts).clip(1, len(tm) - 1)
+    j = np.where(np.abs(tm[j - 1] - ts) < np.abs(tm[j] - ts), j - 1, j)
+    good = np.abs(tm[j] - ts) < 0.02          # same video moment
+    if good.sum() < 8:
+        raise ValueError(f"only {int(good.sum())} time-matched pose pairs")
+    A, B = S[good], M[j[good]]
+
+    def horn(A, B):
+        ca, cb = A.mean(0), B.mean(0)
+        a, b = A - ca, B - cb
+        Sm = a.T @ b
+        Sxx, Sxy, Sxz = Sm[0]; Syx, Syy, Syz = Sm[1]; Szx, Szy, Szz = Sm[2]
+        N = np.array([
+            [Sxx + Syy + Szz, Syz - Szy, Szx - Sxz, Sxy - Syx],
+            [Syz - Szy, Sxx - Syy - Szz, Sxy + Syx, Szx + Sxz],
+            [Szx - Sxz, Sxy + Syx, -Sxx + Syy - Szz, Syz + Szy],
+            [Sxy - Syx, Szx + Sxz, Syz + Szy, -Sxx - Syy + Szz]])
+        vals, vecs = np.linalg.eigh(N)
+        w, x, y, z = vecs[:, np.argmax(vals)]
+        R = np.array([
+            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]])
+        s = float((a @ R.T * b).sum() / (a * a).sum())
+        t = cb - s * (R @ ca)
+        res = np.linalg.norm((s * (R @ A.T)).T + t - B, axis=1)
+        return s, R, t, [float(w), float(x), float(y), float(z)], res
+
+    s, R, t, q, res = horn(A, B)
+    keep = res <= np.quantile(res, 0.75)      # trim the worst quarter, refit
+    if keep.sum() >= 8:
+        s, R, t, q, res = horn(A[keep], B[keep])
+    rmse = float(np.sqrt((res ** 2).mean()))
+    span = float(np.linalg.norm(B.max(0) - B.min(0)))
+    if not (s > 0 and np.isfinite(rmse)) or rmse > 0.1 * span:
+        raise ValueError(f"pose match did not converge (rmse {rmse:.2f} vs span {span:.1f})")
+    return {"scale": float(s), "q": q, "t": [float(v) for v in t],
+            "rmse": rmse, "n": int(len(res))}
+
+
+# Pose-based automatic splat->map registration (exact, no clicking): uses the
+# camera poses both pipelines solved for the same video.
+@app.function(image=mesh_image, cpu=2, memory=4096, timeout=600, volumes={DATA: volume})
+def auto_register(job_id: str):
+    import json
+    from pathlib import Path
+
+    volume.reload()
+    job_dir = Path(DATA) / "jobs" / job_id
+    try:
+        _set(job_id, autoreg_status="running")
+        transforms = json.load(open(job_dir / "poses_splat.json"))
+        recon = json.load(open(job_dir / "odm" / "reconstruction.json"))[0]
+        r = _pose_registration(transforms, recon)
+        r["method"] = "poses"
+        r["created"] = time.time()
+        _set(job_id, registration=r, autoreg_status="done")
+        print("auto-registered:", r, flush=True)
+    except Exception as e:
+        _set(job_id, autoreg_status="error", autoreg_error=str(e))
+        raise
+
+
 # Backfill map metadata for ODM runs made before meta.json existed
 @app.function(image=odm_image, cpu=2, memory=4096, timeout=600, volumes={DATA: volume})
 def odm_meta(job_id: str):
@@ -454,7 +578,7 @@ def web():
 
     @api.get("/api/version")
     def version():
-        return {"marker": "v-walk-1", "autoframe_in_page": "autoFrame" in PAGE}
+        return {"marker": "v-autoreg-1", "autoframe_in_page": "autoFrame" in PAGE}
 
     @api.get("/api/jobs")
     def list_jobs():
@@ -551,6 +675,23 @@ def web():
             return JSONResponse({"error": "map layer not built yet"}, status_code=409)
         odm_meta.spawn(job_id)
         return {"ok": True}
+
+    @api.post("/api/jobs/{job_id}/autoreg")
+    def start_autoreg(job_id: str):
+        rec = jobs.get(job_id)
+        if rec is None:
+            return JSONResponse({"error": "unknown job"}, status_code=404)
+        volume.reload()
+        job_dir = Path(DATA) / "jobs" / job_id
+        if not (job_dir / "poses_splat.json").exists() or \
+           not (job_dir / "odm" / "reconstruction.json").exists():
+            return JSONResponse(
+                {"error": "pose data missing — available for jobs whose splat and "
+                          "map pipelines ran after this feature (or after a re-run)"},
+                status_code=409)
+        _set(job_id, autoreg_status="queued", autoreg_error="")
+        auto_register.spawn(job_id)
+        return {"job_id": job_id, "autoreg_status": "queued"}
 
     @api.post("/api/jobs/{job_id}/registration")
     async def save_registration(job_id: str, payload: dict):
@@ -690,6 +831,7 @@ h2{font-size:15px;font-weight:500;color:var(--dim);text-transform:uppercase;
   <div id="bpbar">
     <span class="vname" id="bpname"></span>
     <button id="bpmode" title="Toggle orthophoto / elevation relief">Relief</button>
+    <button id="bpauto" title="Automatic alignment from both pipelines' camera poses — no clicking. Needs pose data (jobs run after this feature)">Auto-align</button>
     <button id="bpreg" title="Mark the map spots matching your numbered 3D points (in order)">Register</button>
     <button id="bpalign" title="Compute the splat-to-map alignment from the point pairs">Align</button>
     <button id="bpclearpts" title="Clear all registration points">Clear pts</button>
@@ -857,6 +999,7 @@ async function fetchBpMeta(id){
 
 function openBlueprint(id, name){
   if(regJob && regJob !== id){ clearRegState(); }
+  loadRegPts(id);
   document.querySelectorAll('#bpcanvas .regdot').forEach(d => d.remove());
   if(regBpJob !== id){ regOdm = []; regOdmUV = []; regBpJob = id; }
   else regOdmUV.forEach((uv, i) => bpAddDot(uv[0], uv[1], i));
@@ -949,31 +1092,77 @@ $('bpimg').addEventListener('click', e => {
   const Z = dsmElev(X, Y);
   if(Z == null){ bpRead('no elevation data at that spot — click nearer the model'); return; }
   regOdm.push([X, Y, Z]); regOdmUV.push([u, v]); regBpJob = $('bpwrap').dataset.id;
+  saveRegPts();
   bpAddDot(u, v, regOdm.length - 1);
   bpRead(`map point ${regOdm.length} set (3D: ${regSplat.length} / map: ${regOdm.length})`);
 });
 
 $('bpalign').addEventListener('click', async () => {
-  const id = $('bpwrap').dataset.id;
-  if(regJob && regJob !== id){ bpRead('3D points belong to a different job — Clear pts'); return; }
-  const n = Math.min(regSplat.length, regOdm.length);
-  if(n < 3){ bpRead(`need ≥3 pairs (3D: ${regSplat.length} / map: ${regOdm.length})`); return; }
-  const r = horn(regSplat.slice(0, n), regOdm.slice(0, n));
-  if(!r){ bpRead('degenerate points — pick spread-out, non-collinear spots'); return; }
-  const resp = await fetch(`/api/jobs/${id}/registration`, {method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({scale: r.scale, q: r.q, t: r.t, rmse: r.rmse, n})});
-  if(!resp.ok){ bpRead('failed to save alignment'); return; }
-  if(recs[id]) recs[id].registration = r;
-  bpRead(`aligned ✓ scale ${r.scale.toFixed(3)} map-u/u · RMSE ${r.rmse.toFixed(2)} map-u · ${n} pairs`);
-  setBpReg(false);
+  try{
+    const id = $('bpwrap').dataset.id;
+    if(regJob && regJob !== id){ bpRead('3D points belong to a different job — Clear pts'); return; }
+    const n = Math.min(regSplat.length, regOdm.length);
+    if(n < 3){ bpRead(`need ≥3 pairs (3D: ${regSplat.length} / map: ${regOdm.length})`); return; }
+    const r = horn(regSplat.slice(0, n), regOdm.slice(0, n));
+    if(!r){ bpRead('degenerate points — pick spread-out, non-collinear spots'); return; }
+    const resp = await fetch(`/api/jobs/${id}/registration`, {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({scale: r.scale, q: r.q, t: r.t, rmse: r.rmse, n})});
+    if(!resp.ok){ bpRead('failed to save alignment (HTTP ' + resp.status + ')'); return; }
+    if(recs[id]) recs[id].registration = r;
+    try{ localStorage.removeItem('regpts-' + id); }catch(e){}
+    bpRead(`aligned ✓ scale ${r.scale.toFixed(3)} map-u/u · RMSE ${r.rmse.toFixed(2)} map-u · ${n} pairs`);
+    setBpReg(false);
+  }catch(err){ bpRead('align failed: ' + (err.message || err)); }
 });
 $('bpclearpts').addEventListener('click', () => { clearRegState(); bpRead(''); setRead(''); });
 
+$('bpauto').addEventListener('click', async () => {
+  const id = $('bpwrap').dataset.id;
+  try{
+    const r = await fetch(`/api/jobs/${id}/autoreg`, {method: 'POST'});
+    if(r.status === 409){ bpRead((await r.json()).error); return; }
+    if(!r.ok){ bpRead('auto-align failed to start (HTTP ' + r.status + ')'); return; }
+    bpRead('auto-aligning from camera poses…');
+    for(let i = 0; i < 30; i++){
+      await new Promise(res => setTimeout(res, 3000));
+      const rec = recs[id] || {};
+      if(rec.autoreg_status === 'done' && rec.registration){
+        const g = rec.registration;
+        bpRead(`auto-aligned ✓ scale ${g.scale.toFixed(3)} map-u/u · RMSE ${g.rmse.toFixed(2)} map-u · ${g.n} cameras`);
+        return;
+      }
+      if(rec.autoreg_status === 'error'){ bpRead('auto-align failed: ' + (rec.autoreg_error || '')); return; }
+    }
+    bpRead('auto-align timed out — check back shortly');
+  }catch(err){ bpRead('auto-align failed: ' + (err.message || err)); }
+});
+
 function clearRegState(){
+  const id = regJob || regBpJob;
   regSplat = []; regOdm = []; regOdmUV = []; regJob = null; regBpJob = null;
   document.querySelectorAll('#bpcanvas .regdot').forEach(d => d.remove());
   if(regGroup) regGroup.clear();
+  if(id) try{ localStorage.removeItem('regpts-' + id); }catch(e){}
+}
+
+// in-progress registration points survive page reloads
+function saveRegPts(){
+  const id = regJob || regBpJob;
+  if(!id) return;
+  try{ localStorage.setItem('regpts-' + id,
+    JSON.stringify({s: regSplat, o: regOdm, uv: regOdmUV})); }catch(e){}
+}
+function loadRegPts(id){
+  if(regSplat.length || regOdm.length) return;
+  try{
+    const raw = localStorage.getItem('regpts-' + id);
+    if(!raw) return;
+    const p = JSON.parse(raw);
+    regSplat = p.s || []; regOdm = p.o || []; regOdmUV = p.uv || [];
+    if(regSplat.length) regJob = id;
+    if(regOdm.length) regBpJob = id;
+  }catch(e){}
 }
 
 // -- Horn's closed-form absolute orientation (quaternion, with scale)
@@ -1067,6 +1256,7 @@ async function openViewer(jobId, name, keepFlip=false){
   setMeasure(false); setReg3d(false);
   markGroup = null; regGroup = null; mPts = []; lastDist = null; setRead('');
   if(regJob && regJob !== jobId){ regSplat = []; regOdm = []; regOdmUV = []; regJob = null; }
+  loadRegPts(jobId);
   if(viewer){ try{ await viewer.dispose(); }catch(e){} viewer = null; }
   $('viewer').replaceChildren();
   viewer = new GS.Viewer({
@@ -1401,6 +1591,7 @@ $('viewer').addEventListener('mouseup', e => {
     regJob = vJob;
     regSplat.push([p.x, p.y, p.z]);
     addRegMark(p, regSplat.length - 1);
+    saveRegPts();
     setRead(`3D point ${regSplat.length} set (map: ${regOdm.length}) — mark the same spot on the Blueprint`);
   }
 }, true);
